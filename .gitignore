@@ -1,0 +1,29 @@
+# Build output (binaries + local data store)
+build/out/
+
+# Real / local WPAD data — never commit these
+*.dat
+*.history.json
+wpad-store.json
+wpad-workspace.json
+
+# Generated office docs (may contain environment-specific examples)
+docs/
+
+# Agent / IDE / OS
+.claude/
+.vs/
+*.user
+*.suo
+*.DotSettings.user
+Thumbs.db
+.DS_Store
+
+# Compiled binaries
+*.exe
+*.dll
+*.pdb
+
+# Node tooling (used only to generate docs)
+node_modules/
+package-lock.json
