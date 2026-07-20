@@ -62,21 +62,31 @@ namespace WpadManager.App
             Controls.Add(_condValue);
 
             Button condInsert = new Button();
-            condInsert.Text = L.T("→ в условие", "→ insert");
+            condInsert.Text = L.T("→ добавить", "→ add");
             condInsert.SetBounds(496, 37, 80, 26);
-            condInsert.Click += delegate { _condText.Text = ComposeCondition(); };
+            condInsert.Click += delegate { InsertCondition(); };
             Controls.Add(condInsert);
 
+            // Label is kept narrow so it cannot overlap (and swallow clicks on) the Clear button.
             Add(new Label(),
-                L.T("Условие (каждый домен/URL — отдельной строкой, можно править вручную):",
-                    "Condition (one domain/URL per line, editable by hand):"),
-                12, 72, 564, 18, FontStyle.Regular);
+                L.T("Условие — свободно редактируемый текст (значения добавляются через «или»):",
+                    "Condition — freely editable text (values are appended with OR):"),
+                12, 72, 470, 18, FontStyle.Regular);
+
+            Button condClear = new Button();
+            condClear.Text = L.T("Очистить", "Clear");
+            condClear.SetBounds(496, 68, 80, 24);
+            condClear.Click += delegate { _condText.Clear(); _condText.Focus(); };
+            Controls.Add(condClear);
+
             _condText = new TextBox();
             _condText.Multiline = true;
-            _condText.ScrollBars = ScrollBars.Vertical;
+            _condText.ScrollBars = ScrollBars.Both;
             _condText.WordWrap = false;
+            _condText.AcceptsTab = false;
+            _condText.ReadOnly = false;          // always hand-editable
             _condText.Font = new Font(FontFamily.GenericMonospace, 9f);
-            _condText.SetBounds(12, 92, 564, 140);
+            _condText.SetBounds(12, 94, 564, 138);
             _condText.Text = cond;
             Controls.Add(_condText);
 
@@ -145,26 +155,58 @@ namespace WpadManager.App
             Controls.Add(l);
         }
 
+        // Build ONE predicate from the builder inputs. Returns null when the input is not
+        // usable — the caller must then leave the existing condition untouched.
         private string ComposeCondition()
         {
-            string v = _condValue.Text.Trim().Replace("\"", "\\\"");
+            string raw = _condValue.Text.Trim();
+            string v = raw.Replace("\"", "\\\"");
+
+            // Everything except "plain host name" needs a value.
+            if (_condType.SelectedIndex != 3 && raw.Length == 0)
+            {
+                MessageBox.Show(L.T("Введите значение (домен, URL-шаблон или подсеть).",
+                    "Enter a value (domain, URL pattern or subnet)."),
+                    L.T("Значение", "Value"), MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+
             switch (_condType.SelectedIndex)
             {
                 case 0: return "dnsDomainIs(host, \"" + v + "\")";
                 case 1: return "shExpMatch(url, \"" + v + "\")";
                 case 2:
                     string net, mask;
-                    if (!ParseCidr(_condValue.Text.Trim(), out net, out mask))
+                    if (!ParseCidr(raw, out net, out mask))
                     {
                         MessageBox.Show(L.T("Подсеть в формате 10.0.0.0/24 или 10.0.0.0/255.255.255.0",
                             "Subnet as 10.0.0.0/24 or 10.0.0.0/255.255.255.0"),
                             L.T("Подсеть", "Subnet"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return _condText.Text;
+                        return null;
                     }
                     return "isInNet(myIpAddress(), \"" + net + "\", \"" + mask + "\")";
                 case 3: return "isPlainHostName(host)";
-                default: return _condText.Text;
+                default: return null;
             }
+        }
+
+        // Append the composed predicate to the condition instead of replacing it, so adding a
+        // value never wipes what is already there. Existing text is joined with "||" (the usual
+        // PAC idiom for a list of domains); change it to "&&" by hand if you need AND.
+        private void InsertCondition()
+        {
+            string fragment = ComposeCondition();
+            if (string.IsNullOrEmpty(fragment)) return;   // invalid input: keep condition as-is
+
+            string current = _condText.Text.Trim();
+            _condText.Text = current.Length == 0
+                ? fragment
+                : current + " ||" + Environment.NewLine + fragment;
+
+            _condValue.Clear();
+            _condText.SelectionStart = _condText.TextLength;
+            _condText.ScrollToCaret();
+            _condText.Focus();
         }
 
         private string ComposeAction()

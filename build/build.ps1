@@ -56,8 +56,12 @@ if ($App) {
     if ($appCs.Count -gt 0) {
         $allCs  = @(Get-Cs (Join-Path $src "WpadManager.Core")) + $appCs
         $appExe = Join-Path $out "WpadManager.exe"
+        # Embed the application icon when it has been generated (build/make-icon.ps1).
+        $icon    = Join-Path $root "assets\app.ico"
+        $iconArg = @()
+        if (Test-Path $icon) { $iconArg = @("/win32icon:$icon") }
         Write-Host "Compiling WpadManager.exe (WinForms)..." -ForegroundColor Cyan
-        & $csc /nologo /target:winexe /out:"$appExe" /langversion:5 /r:System.Windows.Forms.dll /r:System.Drawing.dll $allCs
+        & $csc /nologo /target:winexe /out:"$appExe" /langversion:5 /r:System.Windows.Forms.dll /r:System.Drawing.dll @iconArg $allCs
         if ($LASTEXITCODE -ne 0) { throw "App build failed" }
         Write-Host "  -> $appExe (portable)" -ForegroundColor Green
     }

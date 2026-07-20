@@ -44,6 +44,9 @@ namespace WpadManager.App
             Text = "WPAD / PAC File Manager";
             Width = 1040; Height = 700;
             StartPosition = FormStartPosition.CenterScreen;
+            // Reuse the icon embedded in the .exe for the title bar / taskbar.
+            try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch { }
 
             BuildAllUi();
             LoadWorkspace();
