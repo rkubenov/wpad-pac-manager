@@ -8,28 +8,54 @@ namespace WpadManager.Core.Validate
     // Import-time security gate. PAC files are JavaScript, so a "wild" import could
     // in principle smuggle in eval/XMLHttpRequest/ActiveX/network calls. We parse the
     // source to a real AST and flag anything outside the safe PAC subset:
-    //   - calls to dangerous globals (eval, Function, XMLHttpRequest, ActiveXObject, ...)
-    //   - method calls / property access on host objects (document, window, process, ...)
+    //   - calls to, or bare references of, dangerous globals (eval, Function, this, ...)
+    //   - property access on host objects and prototype-chain escapes (.constructor, ...)
+    //   - redefinition of PAC built-ins (dnsResolve = eval; function dnsDomainIs(){...})
+    //   - JS keywords our subset parser does not model (while, new, try, ...): what we
+    //     parsed would no longer be what the browser runs, so the file cannot be vetted
+    //   - DNS lookups of computed names (dnsResolve(host + ".x.evil")) and names built
+    //     from host/url — the classic way to leak every visited host to an outside DNS
     //   - calls to functions that are neither PAC helpers nor declared in this file
-    // This is advisory for the operator; the interpreter is whitelist-limited anyway,
-    // so unknown constructs are safe-by-construction, but we surface them explicitly.
+    // The analysis is only as good as the parser's agreement with real JavaScript; the
+    // lexer therefore follows JS for line terminators and string escapes, and anything
+    // it does not understand is a syntax error (fail closed).
     public static class Safety
     {
-        private static readonly HashSet<string> DangerousGlobals = BuildDangerous();
+        private static readonly HashSet<string> DangerousGlobals = Set(
+            "eval", "Function", "setTimeout", "setInterval", "setImmediate",
+            "require", "import", "fetch", "XMLHttpRequest", "ActiveXObject",
+            "importScripts", "WScript", "GetObject", "execScript", "Worker",
+            "document", "window", "globalThis", "global", "process", "self",
+            "navigator", "location", "localStorage", "WScriptShell", "this");
 
-        private static HashSet<string> BuildDangerous()
+        // Reserved words the subset parser has no grammar for. It would misread them as
+        // plain identifiers (e.g. `while (x) {}` as a call to "while"), so seeing one
+        // means our AST no longer matches what the browser executes.
+        private static readonly HashSet<string> UnsupportedKeywords = Set(
+            "new", "delete", "typeof", "void", "in", "instanceof", "while", "for", "do",
+            "switch", "case", "default", "break", "continue", "try", "catch", "finally",
+            "throw", "with", "class", "const", "let", "yield", "await", "export",
+            "debugger", "super", "extends", "function", "else", "arguments");
+
+        // Properties that reach the Function constructor or rewrite the prototype chain.
+        private static readonly HashSet<string> DangerousProps = Set(
+            "constructor", "__proto__", "prototype", "__defineGetter__", "__defineSetter__",
+            "__lookupGetter__", "__lookupSetter__", "caller", "callee");
+
+        // PAC helpers that send their first argument to the DNS resolver.
+        private static readonly HashSet<string> DnsLookups = Set(
+            "dnsResolve", "dnsResolveEx", "isResolvable", "isResolvableEx", "isInNet", "isInNetEx");
+
+        private static HashSet<string> Set(params string[] names)
         {
-            HashSet<string> s = new HashSet<string>(StringComparer.Ordinal);
-            string[] names = new string[]
-            {
-                "eval", "Function", "setTimeout", "setInterval", "setImmediate",
-                "require", "import", "fetch", "XMLHttpRequest", "ActiveXObject",
-                "importScripts", "WScript", "GetObject", "execScript", "Worker",
-                "document", "window", "globalThis", "global", "process", "self",
-                "navigator", "location", "localStorage", "WScriptShell"
-            };
-            for (int i = 0; i < names.Length; i++) s.Add(names[i]);
-            return s;
+            return new HashSet<string>(names, StringComparer.Ordinal);
+        }
+
+        // PAC built-ins plus the entry points: redefining any of them silently changes what
+        // every rule means (and what our simulator/shadowing analysis assumes).
+        private static bool IsBuiltin(string name)
+        {
+            return PacFunctions.IsKnown(name) || name == "FindProxyForURL" || name == "FindProxyForURLEx";
         }
 
         // Analyze raw PAC text. On a hard parse error returns a single SYNTAX finding
@@ -65,31 +91,82 @@ namespace WpadManager.Core.Validate
             return report;
         }
 
-        private static void CollectDeclaredFns(Node n, HashSet<string> declared)
+        private static void CollectDeclaredFns(Node root, HashSet<string> declared)
         {
-            if (n == null) return;
-            FunctionDecl fd = n as FunctionDecl;
-            if (fd != null && fd.Name != null) declared.Add(fd.Name);
-            foreach (Node c in Children(n)) CollectDeclaredFns(c, declared);
+            Stack<Node> pending = new Stack<Node>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                Node n = pending.Pop();
+                FunctionDecl fd = n as FunctionDecl;
+                if (fd != null && fd.Name != null) declared.Add(fd.Name);
+                foreach (Node c in Children(n)) pending.Push(c);
+            }
         }
 
-        private static void Walk(Node n, HashSet<string> declared, Report report)
+        // Pre-order walk with an explicit stack: a long "a || b || ..." domain list is a
+        // left-deep tree thousands of levels deep, too deep for recursion.
+        private static void Walk(Node root, HashSet<string> declared, Report report)
         {
-            if (n == null) return;
+            Stack<KeyValuePair<Node, Node>> pending = new Stack<KeyValuePair<Node, Node>>();
+            pending.Push(new KeyValuePair<Node, Node>(root, null));
+            while (pending.Count > 0)
+            {
+                KeyValuePair<Node, Node> item = pending.Pop();
+                Inspect(item.Key, item.Value, declared, report);
+                List<Node> kids = Children(item.Key);
+                for (int i = kids.Count - 1; i >= 0; i--)   // reversed: children come off in order
+                    pending.Push(new KeyValuePair<Node, Node>(kids[i], item.Key));
+            }
+        }
+
+        private static void Inspect(Node n, Node parent, HashSet<string> declared, Report report)
+        {
+            FunctionDecl fd = n as FunctionDecl;
+            if (fd != null && fd.Name != null && fd.Name != "FindProxyForURL" && fd.Name != "FindProxyForURLEx" &&
+                IsBuiltin(fd.Name))
+                Add(report, Severity.Critical, "SEC_BUILTIN_OVERRIDE",
+                    "Function '" + fd.Name + "' redefines a PAC built-in.", n.Line);
+
+            VarStatement vs = n as VarStatement;
+            if (vs != null)
+                for (int i = 0; i < vs.Names.Count; i++)
+                    if (IsBuiltin(vs.Names[i]) || DangerousGlobals.Contains(vs.Names[i]))
+                        Add(report, Severity.Critical, "SEC_BUILTIN_OVERRIDE",
+                            "'var " + vs.Names[i] + "' shadows a PAC built-in or global.", n.Line);
+
+            Identifier id = n as Identifier;
+            if (id != null) InspectIdentifier(id, parent, report);
 
             CallExpr call = n as CallExpr;
             if (call != null) InspectCall(call, declared, report);
 
             MemberExpr mem = n as MemberExpr;
-            if (mem != null)
-            {
-                string root = RootName(mem);
-                if (root != null && DangerousGlobals.Contains(root))
-                    Add(report, Severity.Critical, "SEC_HOST_ACCESS",
-                        "Access to host object '" + root + "' is not allowed in a PAC file.", n.Line);
-            }
+            if (mem != null) InspectMember(mem, report);
 
-            foreach (Node c in Children(n)) Walk(c, declared, report);
+            BinaryExpr bin = n as BinaryExpr;
+            if (bin != null) InspectBinary(bin, parent, report);
+        }
+
+        private static void InspectIdentifier(Identifier id, Node parent, Report report)
+        {
+            if (UnsupportedKeywords.Contains(id.Name))
+            {
+                Add(report, Severity.Error, "SEC_UNSUPPORTED",
+                    "'" + id.Name + "' is not supported by the PAC subset parser; the file cannot be security-vetted.",
+                    id.Line);
+                return;
+            }
+            if (!DangerousGlobals.Contains(id.Name)) return;
+
+            // Calls and member roots get their own, more specific finding.
+            CallExpr pc = parent as CallExpr;
+            if (pc != null && pc.Callee == id) return;
+            MemberExpr pm = parent as MemberExpr;
+            if (pm != null && pm.Obj == id) return;
+
+            Add(report, Severity.Critical, "SEC_DANGEROUS_REF",
+                "Reference to '" + id.Name + "' is not allowed in a PAC file.", id.Line);
         }
 
         private static void InspectCall(CallExpr call, HashSet<string> declared, Report report)
@@ -102,10 +179,21 @@ namespace WpadManager.Core.Validate
                     Add(report, Severity.Critical, "SEC_DANGEROUS_CALL",
                         "Call to '" + id.Name + "' is forbidden in a PAC file.", call.Line);
                 }
+                else if (UnsupportedKeywords.Contains(id.Name))
+                {
+                    // already reported as SEC_UNSUPPORTED by the identifier check
+                }
                 else if (!PacFunctions.IsKnown(id.Name) && !declared.Contains(id.Name))
                 {
                     Add(report, Severity.Warning, "SEC_UNKNOWN_CALL",
                         "Call to '" + id.Name + "' is not a PAC helper or a function defined in this file.",
+                        call.Line);
+                }
+
+                if (DnsLookups.Contains(id.Name) && call.Args.Count > 0 && !IsPlainDnsArgument(call.Args[0]))
+                {
+                    Add(report, Severity.Error, "SEC_DNS_COMPUTED",
+                        "'" + id.Name + "' looks up a computed name; this can leak visited hosts to an outside DNS server.",
                         call.Line);
                 }
                 return;
@@ -120,7 +208,80 @@ namespace WpadManager.Core.Validate
                     ? Severity.Critical : Severity.Warning;
                 Add(report, sev, "SEC_METHOD_CALL",
                     "Method call on '" + label + "." + me.Prop + "' is outside the PAC subset.", call.Line);
+                return;
             }
+
+            // f()() and similar: the function being called is itself computed.
+            Add(report, Severity.Warning, "SEC_INDIRECT_CALL",
+                "Call of a computed function value is outside the PAC subset.", call.Line);
+        }
+
+        // What a DNS helper may look up: a variable (normally host), a literal, or the result
+        // of another call (dnsResolve(host), myIpAddress()) whose own arguments are checked.
+        private static bool IsPlainDnsArgument(Node a)
+        {
+            if (a is Identifier || a is StringLit || a is NumberLit) return true;
+            CallExpr c = a as CallExpr;
+            return c != null && c.Callee is Identifier;
+        }
+
+        private static void InspectMember(MemberExpr mem, Report report)
+        {
+            string root = RootName(mem);
+            if (root != null && DangerousGlobals.Contains(root))
+                Add(report, Severity.Critical, "SEC_HOST_ACCESS",
+                    "Access to host object '" + root + "' is not allowed in a PAC file.", mem.Line);
+
+            string prop = mem.Prop;
+            if (mem.Index != null)
+            {
+                StringLit lit = mem.Index as StringLit;
+                if (lit != null) prop = lit.Value;
+                else if (!(mem.Index is NumberLit))
+                {
+                    Add(report, Severity.Warning, "SEC_COMPUTED_MEMBER",
+                        "Computed property access [...] cannot be vetted.", mem.Line);
+                    return;
+                }
+            }
+            if (prop != null && DangerousProps.Contains(prop))
+                Add(report, Severity.Critical, "SEC_PROTO_ACCESS",
+                    "Access to '" + prop + "' can reach the Function constructor and is not allowed.", mem.Line);
+        }
+
+        private static void InspectBinary(BinaryExpr bin, Node parent, Report report)
+        {
+            bool assign = bin.Op == "=" || bin.Op == "+=" || bin.Op == "-=" || bin.Op == "*=" || bin.Op == "/=";
+            Identifier target = bin.Left as Identifier;
+            if (assign && target != null && (IsBuiltin(target.Name) || DangerousGlobals.Contains(target.Name)))
+                Add(report, Severity.Critical, "SEC_BUILTIN_OVERRIDE",
+                    "Assignment to '" + target.Name + "' replaces a PAC built-in or global.", bin.Line);
+
+            // Building a new name from host/url is how a PAC exfiltrates browsing data
+            // (to DNS or anywhere else). Report once, at the outermost '+' of a chain.
+            if (bin.Op == "+" || bin.Op == "+=")
+            {
+                BinaryExpr pb = parent as BinaryExpr;
+                bool nested = pb != null && (pb.Op == "+" || pb.Op == "+=");
+                if (!nested && ConcatUsesHostOrUrl(bin))
+                    Add(report, Severity.Warning, "SEC_NAME_BUILD",
+                        "A new string is built from host/url; check it cannot leak browsing data.", bin.Line);
+            }
+        }
+
+        private static bool ConcatUsesHostOrUrl(Node root)
+        {
+            Stack<Node> pending = new Stack<Node>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                Node n = pending.Pop();
+                Identifier id = n as Identifier;
+                if (id != null && (id.Name == "host" || id.Name == "url")) return true;
+                BinaryExpr b = n as BinaryExpr;
+                if (b != null && (b.Op == "+" || b.Op == "+=")) { pending.Push(b.Left); pending.Push(b.Right); }
+            }
+            return false;
         }
 
         // Walk a MemberExpr/CallExpr chain down to the base identifier name.
@@ -139,7 +300,7 @@ namespace WpadManager.Core.Validate
         }
 
         // Enumerate the direct child nodes of any AST node (structural, type-driven).
-        private static IEnumerable<Node> Children(Node n)
+        private static List<Node> Children(Node n)
         {
             List<Node> list = new List<Node>();
 
@@ -165,7 +326,12 @@ namespace WpadManager.Core.Validate
             if (ret != null) { if (ret.Argument != null) list.Add(ret.Argument); return list; }
 
             VarStatement vs = n as VarStatement;
-            if (vs != null) { if (vs.Inits != null) list.AddRange(vs.Inits); return list; }
+            if (vs != null)
+            {
+                if (vs.Inits != null)
+                    for (int i = 0; i < vs.Inits.Count; i++) if (vs.Inits[i] != null) list.Add(vs.Inits[i]);
+                return list;
+            }
 
             ExpressionStatement es = n as ExpressionStatement;
             if (es != null) { if (es.Expr != null) list.Add(es.Expr); return list; }
@@ -179,7 +345,12 @@ namespace WpadManager.Core.Validate
             }
 
             MemberExpr me = n as MemberExpr;
-            if (me != null) { if (me.Obj != null) list.Add(me.Obj); return list; }
+            if (me != null)
+            {
+                if (me.Obj != null) list.Add(me.Obj);
+                if (me.Index != null) list.Add(me.Index);
+                return list;
+            }
 
             LogicalExpr lg = n as LogicalExpr;
             if (lg != null) { if (lg.Left != null) list.Add(lg.Left); if (lg.Right != null) list.Add(lg.Right); return list; }

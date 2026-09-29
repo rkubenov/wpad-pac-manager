@@ -27,7 +27,14 @@ namespace WpadManager.App
 
         public string ConditionText { get { return _condText.Text.Trim(); } }
         public string ActionTextValue { get { return _actText.Text.Trim(); } }
-        public string CommentText { get { string s = _comment.Text.Trim(); return s.Length > 0 ? s : null; } }
+        public string CommentText
+        {
+            get
+            {
+                string s = _comment.Text.Replace("\r\n", "\n").Trim();
+                return s.Length > 0 ? s : null;
+            }
+        }
         public bool RuleEnabled { get { return _enabled.Checked; } }
 
         public RuleEditForm(Rule existing) : this(existing, "", "DIRECT") { }
@@ -128,14 +135,20 @@ namespace WpadManager.App
 
             // ----- meta -----
             Add(new Label(), L.T("Комментарий:", "Comment:"), 12, 354, 90, 20, FontStyle.Regular);
+            // Multi-line: an imported rule can carry several comment lines, and editing the rule
+            // must not glue them together.
             _comment = new TextBox();
-            _comment.SetBounds(104, 352, 472, 24);
-            if (existing != null && existing.Comment != null) _comment.Text = existing.Comment;
+            _comment.Multiline = true;
+            _comment.AcceptsReturn = true;
+            _comment.ScrollBars = ScrollBars.Vertical;
+            _comment.SetBounds(104, 352, 472, 52);
+            if (existing != null && existing.Comment != null)
+                _comment.Text = existing.Comment.Replace("\r\n", "\n").Replace("\n", "\r\n");
             Controls.Add(_comment);
 
             _enabled = new CheckBox();
             _enabled.Text = L.T("Правило включено", "Rule enabled");
-            _enabled.SetBounds(12, 384, 200, 22);
+            _enabled.SetBounds(12, 414, 200, 22);
             _enabled.Checked = existing == null ? true : existing.Enabled;
             Controls.Add(_enabled);
 
@@ -146,6 +159,7 @@ namespace WpadManager.App
             cancel.SetBounds(492, 472, 84, 30);
             Controls.Add(ok); Controls.Add(cancel);
             AcceptButton = ok; CancelButton = cancel;
+            Theme.Apply(this);
         }
 
         private void Add(Label l, string text, int x, int y, int w, int h, FontStyle style)
@@ -305,6 +319,7 @@ namespace WpadManager.App
             close.SetBounds(528, 460, 84, 28);
             Controls.Add(close);
             CancelButton = close;
+            Theme.Apply(this);
         }
 
         private void Lbl(string text, int x, int y, int w)
@@ -346,7 +361,8 @@ namespace WpadManager.App
             for (int i = 0; i < r.Trace.Count; i++)
             {
                 SimStep s = r.Trace[i];
-                sb.AppendLine("  " + L.T("правило ", "rule ") + s.Order + "  [" + s.Result + "]  " + s.Reason);
+                string who = s.Order >= 0 ? L.T("правило ", "rule ") + s.Order : L.T("код     ", "code   ");
+                sb.AppendLine("  " + who + "  [" + s.Result + "]  " + s.Reason);
             }
             sb.AppendLine();
             sb.AppendLine(r.Matched != null
@@ -395,6 +411,7 @@ namespace WpadManager.App
             close.SetBounds(576, 9, 84, 28);
             bottom.Controls.Add(rollback); bottom.Controls.Add(close);
             Controls.Add(bottom);
+            Theme.Apply(this);
         }
 
         private void DoRollback()

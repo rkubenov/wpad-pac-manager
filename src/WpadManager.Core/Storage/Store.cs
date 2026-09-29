@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using WpadManager.Core.Model;
 using WpadManager.Core.Generator;
 using JsonLib = WpadManager.Core.Json.Json;  // class, not the sibling namespace
@@ -42,6 +43,8 @@ namespace WpadManager.Core.Storage
         public List<string> OpenFiles = new List<string>();
         public string ActiveFile;
         public string Language;   // UI language code: "ru" (default) or "en"
+        public string Theme;      // UI theme: "system" (default), "light" or "dark"
+        public string HistoryDir; // where per-file histories live; null = "history" next to the exe
     }
 
     public class DiffResult
@@ -90,13 +93,56 @@ namespace WpadManager.Core.Storage
             return Path.Combine(ExeDir(), "wpad-workspace.json");
         }
 
-        // Per-file history sidecar: "<sourceFile>.history.json" in the same folder, so each
-        // .dat/.pac carries its own versions/audit and the app knows exactly which file an
-        // edit belongs to.
+        // Where older versions kept a file's history: "<sourceFile>.history.json" right next
+        // to it. Only read now, to move such files into the history folder (see below).
         public static string SidecarPath(string sourcePath)
         {
             if (string.IsNullOrEmpty(sourcePath)) return DefaultPath();
             return sourcePath + ".history.json";
+        }
+
+        // Default history folder: "history" next to the exe (shared by all admins when the
+        // exe itself sits on a shared folder).
+        public static string DefaultHistoryDir()
+        {
+            return Path.Combine(ExeDir(), "history");
+        }
+
+        // A file's history: "<historyDir>\<file name>-<hash of full path>.history.json".
+        // Deliberately not next to the PAC file, whose folder is usually the web server's —
+        // anyone on the network could download the history there (old rules, admin names,
+        // notes). The hash keeps two files of the same name (two sites' wpad.dat) apart; paths
+        // are compared case-insensitively, as Windows does.
+        public static string HistoryPath(string sourcePath, string historyDir)
+        {
+            string full;
+            try { full = Path.GetFullPath(sourcePath); }
+            catch { full = sourcePath; }
+            string hash = TextFile.Fingerprint(System.Text.Encoding.UTF8.GetBytes(full.ToLowerInvariant()));
+            return Path.Combine(historyDir, Path.GetFileName(full).ToLowerInvariant() + "-" +
+                hash.Substring(0, 10).ToLowerInvariant() + ".history.json");
+        }
+
+        // Move a history file from the old place (next to the PAC) into historyDir, merging it
+        // with any history already there, and remove it from the PAC's folder. Returns true if
+        // something was moved. A damaged old file is set aside by LoadOrRecover, not moved.
+        public static bool MigrateLegacySidecar(string sourcePath, string historyDir)
+        {
+            string damaged;
+            return MigrateLegacySidecar(sourcePath, historyDir, out damaged);
+        }
+
+        // `damagedMovedTo`: set when the old file could not be read and was set aside instead.
+        public static bool MigrateLegacySidecar(string sourcePath, string historyDir, out string damagedMovedTo)
+        {
+            damagedMovedTo = null;
+            string legacy = SidecarPath(sourcePath);
+            if (!File.Exists(legacy)) return false;
+            Store old = LoadOrRecover(legacy, out damagedMovedTo);
+            if (damagedMovedTo != null) return false;
+            SaveMerged(HistoryPath(sourcePath, historyDir), old);
+            File.Delete(legacy);
+            return true;
         }
 
         // Load an existing store, or create an empty one if the file does not exist.
@@ -108,7 +154,7 @@ namespace WpadManager.Core.Storage
                 s.Current = new RuleSet();
                 return s;
             }
-            string text = File.ReadAllText(path);
+            string text = TextFile.Read(path);
             Store loaded = JsonLib.Deserialize<Store>(text);
             if (loaded == null) loaded = new Store();
             if (loaded.Current == null) loaded.Current = new RuleSet();
@@ -117,10 +163,72 @@ namespace WpadManager.Core.Storage
             return loaded;
         }
 
+        // Like Load, but a history file that exists yet cannot be parsed (hand-edited,
+        // truncated) is renamed to "<name>.corrupt-<UTC time>" and an empty store returned,
+        // so one broken sidecar can neither crash the app nor be silently overwritten.
+        // `movedTo` is the new name, or null when nothing was moved. I/O errors propagate.
+        public static Store LoadOrRecover(string path, out string movedTo)
+        {
+            movedTo = null;
+            try
+            {
+                return Load(path);
+            }
+            catch (FormatException)
+            {
+                movedTo = path + ".corrupt-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss",
+                    System.Globalization.CultureInfo.InvariantCulture);
+                File.Move(path, movedTo);
+                return Load(path);   // now missing => empty store
+            }
+        }
+
         public static void Save(string path, Store store)
         {
-            string text = JsonLib.Stringify(store, true);
-            File.WriteAllText(path, text);
+            string dir = Path.GetDirectoryName(Path.GetFullPath(path));
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);   // e.g. a new history folder
+            TextFile.Write(path, JsonLib.Stringify(store, true));
+        }
+
+        // Save, but first fold in versions / audit entries that someone else has written to
+        // the same history file since we loaded it (two admins editing one wpad.dat), so
+        // neither loses the other's history. `store` itself ends up with the merged lists.
+        public static void SaveMerged(string path, Store store)
+        {
+            if (File.Exists(path))
+            {
+                string ignored;
+                Store disk = LoadOrRecover(path, out ignored);
+                store.Versions = MergeVersions(disk.Versions, store.Versions);
+                store.Audit = MergeAudit(disk.Audit, store.Audit);
+            }
+            Save(path, store);
+        }
+
+        private static List<VersionEntry> MergeVersions(List<VersionEntry> disk, List<VersionEntry> mine)
+        {
+            List<VersionEntry> all = new List<VersionEntry>(disk);
+            HashSet<string> ids = new HashSet<string>();
+            for (int i = 0; i < disk.Count; i++) if (disk[i].Id != null) ids.Add(disk[i].Id);
+            for (int i = 0; i < mine.Count; i++)
+                if (mine[i].Id == null || !ids.Contains(mine[i].Id)) all.Add(mine[i]);
+            // Stable sort by timestamp (ISO-8601 sorts as text): equal times keep disk first.
+            return all.OrderBy(v => v.Timestamp ?? "", StringComparer.Ordinal).ToList();
+        }
+
+        private static List<AuditEntry> MergeAudit(List<AuditEntry> disk, List<AuditEntry> mine)
+        {
+            List<AuditEntry> all = new List<AuditEntry>(disk);
+            HashSet<string> keys = new HashSet<string>();
+            for (int i = 0; i < disk.Count; i++) keys.Add(AuditKey(disk[i]));
+            for (int i = 0; i < mine.Count; i++)
+                if (keys.Add(AuditKey(mine[i]))) all.Add(mine[i]);
+            return all.OrderBy(a => a.Timestamp ?? "", StringComparer.Ordinal).ToList();
+        }
+
+        private static string AuditKey(AuditEntry a)
+        {
+            return a.Timestamp + "\n" + a.Author + "\n" + a.Action + "\n" + a.Detail;
         }
 
         // Load the workspace list, or an empty one if it does not exist / is unreadable.
@@ -128,7 +236,7 @@ namespace WpadManager.Core.Storage
         {
             if (!File.Exists(path)) return new WorkspaceState();
             WorkspaceState ws;
-            try { ws = JsonLib.Deserialize<WorkspaceState>(File.ReadAllText(path)); }
+            try { ws = JsonLib.Deserialize<WorkspaceState>(TextFile.Read(path)); }
             catch { ws = null; }
             if (ws == null) ws = new WorkspaceState();
             if (ws.OpenFiles == null) ws.OpenFiles = new List<string>();
@@ -137,7 +245,7 @@ namespace WpadManager.Core.Storage
 
         public static void SaveWorkspace(string path, WorkspaceState ws)
         {
-            File.WriteAllText(path, JsonLib.Stringify(ws, true));
+            TextFile.Write(path, JsonLib.Stringify(ws, true));
         }
 
         // Replace the current rule set, snapshot it as a new version, and audit the change.

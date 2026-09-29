@@ -86,16 +86,66 @@ namespace WpadManager.Core.Parser
                 return rs;
             }
 
+            // Comments this tool writes itself (regenerated on every save) are not user text.
+            List<Comment> comments = new List<Comment>();
+            for (int i = 0; i < _prog.Comments.Count; i++)
+                if (!IsGeneratorMarker(_prog.Comments[i])) comments.Add(_prog.Comments[i]);
+
+            // Top-level comments outside every node (file header, notes between helpers).
+            List<string> header = new List<string>();
+            for (int i = 0; i < comments.Count; i++)
+                if (!InsideAny(comments[i], _prog.Body)) header.Add(comments[i].Text);
+            rs.HeaderComment = Join(header);
+
+            // The function body in source order: statements, plus "[disabled]" lines this
+            // tool wrote for disabled rules (they come back as disabled rules).
+            List<BodyItem> items = new List<BodyItem>();
+            for (int i = 0; i < fn.Body.Body.Count; i++)
+            {
+                Node s = fn.Body.Body[i];
+                items.Add(new BodyItem(s, null, s.Start, s.End, s.EndLine));
+            }
+            List<Comment> bodyComments = new List<Comment>();
+            for (int i = 0; i < comments.Count; i++)
+            {
+                Comment c = comments[i];
+                if (c.Start <= fn.Body.Start || c.End > fn.Body.End) continue;
+                Rule disabled = !InsideAny(c, fn.Body.Body) ? ParseDisabledRule(c) : null;
+                if (disabled != null) items.Add(new BodyItem(null, disabled, c.Start, c.End, c.Line));
+                else bodyComments.Add(c);
+            }
+            items.Sort(delegate(BodyItem a, BodyItem b) { return a.Start.CompareTo(b.Start); });
+
+            List<string>[] owned = new List<string>[items.Count];
+            List<string> tail = AssignComments(bodyComments, items, owned);
+
             int order = 0;
             bool sawDefault = false;
-            List<Node> body = fn.Body.Body;
-            for (int i = 0; i < body.Count; i++)
+            List<string> defaultComment = new List<string>();
+            List<UnparsedBlock> waiting = new List<UnparsedBlock>();   // in-body blocks awaiting the next rule
+            for (int k = 0; k < items.Count; k++)
             {
-                Node stmt = body[i];
+                BodyItem item = items[k];
+                string comment = Join(owned[k]);
 
+                if (item.Disabled != null)
+                {
+                    if (sawDefault)
+                    {
+                        // inert text after the final return: keep it as a comment
+                        if (comment != null) defaultComment.Add(comment);
+                        continue;
+                    }
+                    AddRule(rs, item.Disabled, comment, ref order, waiting);
+                    continue;
+                }
+
+                Node stmt = item.Stmt;
                 if (sawDefault)
                 {
-                    AddUnparsed(rs, stmt, "Unreachable: appears after an unconditional return");
+                    UnparsedBlock after = AddUnparsed(rs, stmt, "Unreachable: appears after an unconditional return");
+                    after.Comment = comment;
+                    after.AfterDefault = true;
                     continue;
                 }
 
@@ -107,27 +157,20 @@ namespace WpadManager.Core.Parser
                     {
                         try
                         {
-                            Condition cond = MapCondition(ifs.Test);
                             Rule r = new Rule();
-                            r.Id = NewId();
-                            r.Order = order++;
-                            r.Enabled = true;
-                            r.Condition = cond;
+                            r.Condition = MapCondition(ifs.Test);
                             r.Action = ActionText.Parse(ret);
-                            r.Comment = LeadingComment(ifs.Line);
-                            r.Author = "import";
-                            r.CreatedAt = rs.CreatedAt;
-                            r.UpdatedAt = rs.CreatedAt;
-                            rs.Rules.Add(r);
+                            r.Enabled = true;
+                            AddRule(rs, r, comment, ref order, waiting);
                             continue;
                         }
                         catch (RecognizeException rx)
                         {
-                            AddUnparsed(rs, stmt, "Condition not recognized: " + rx.Message);
+                            AddInBody(rs, stmt, "Condition not recognized: " + rx.Message, comment, waiting);
                             continue;
                         }
                     }
-                    AddUnparsed(rs, stmt, "if-branch is not a simple string return");
+                    AddInBody(rs, stmt, "if-branch is not a simple string return", comment, waiting);
                     continue;
                 }
 
@@ -138,17 +181,130 @@ namespace WpadManager.Core.Parser
                     if (lit != null)
                     {
                         rs.DefaultAction = ActionText.Parse(lit.Value);
+                        if (comment != null) defaultComment.Insert(0, comment);
                         sawDefault = true;
                         continue;
                     }
-                    AddUnparsed(rs, stmt, "Default return is not a plain string");
+                    AddInBody(rs, stmt, "Default return is not a plain string", comment, waiting);
                     continue;
                 }
 
-                AddUnparsed(rs, stmt, "Statement not part of the simple if/return shape");
+                AddInBody(rs, stmt, "Statement not part of the simple if/return shape", comment, waiting);
             }
-
+            defaultComment.AddRange(tail);
+            rs.DefaultComment = Join(defaultComment);
             return rs;
+        }
+
+        // One element of FindProxyForURL's body: a statement, or a disabled rule read back
+        // from its "// [disabled] ..." line.
+        private sealed class BodyItem
+        {
+            public readonly Node Stmt;
+            public readonly Rule Disabled;
+            public readonly int Start, End, EndLine;
+
+            public BodyItem(Node stmt, Rule disabled, int start, int end, int endLine)
+            {
+                Stmt = stmt; Disabled = disabled; Start = start; End = end; EndLine = endLine;
+            }
+        }
+
+        // Give every comment to the item it documents: the item it sits inside (e.g. notes
+        // on the lines of a multi-line condition), else the item it trails on the same line,
+        // else the next item. Comments after the last item are returned (they go with the
+        // default return). Items and comments are both in source order: one forward sweep.
+        private static List<string> AssignComments(List<Comment> comments, List<BodyItem> items, List<string>[] owned)
+        {
+            for (int k = 0; k < owned.Length; k++) owned[k] = new List<string>();
+            List<string> tail = new List<string>();
+            int p = 0;
+            for (int i = 0; i < comments.Count; i++)
+            {
+                Comment c = comments[i];
+                while (p < items.Count && items[p].End <= c.Start) p++;
+                int owner;
+                if (p < items.Count && items[p].Start <= c.Start) owner = p;                 // inside
+                else if (p > 0 && items[p - 1].EndLine == c.Line) owner = p - 1;             // trailing
+                else owner = p < items.Count ? p : -1;                                       // leading
+                if (owner >= 0) owned[owner].Add(c.Text);
+                else tail.Add(c.Text);
+            }
+            return tail;
+        }
+
+        private void AddRule(RuleSet rs, Rule r, string comment, ref int order, List<UnparsedBlock> waiting)
+        {
+            r.Id = NewId();
+            r.Order = order++;
+            r.Comment = comment;
+            r.Author = "import";
+            r.CreatedAt = rs.CreatedAt;
+            r.UpdatedAt = rs.CreatedAt;
+            rs.Rules.Add(r);
+            // Code that sat just before this rule stays just before it.
+            for (int i = 0; i < waiting.Count; i++) waiting[i].BeforeRuleId = r.Id;
+            waiting.Clear();
+        }
+
+        private void AddInBody(RuleSet rs, Node stmt, string reason, string comment, List<UnparsedBlock> waiting)
+        {
+            UnparsedBlock ub = AddUnparsed(rs, stmt, reason);
+            ub.Comment = comment;
+            waiting.Add(ub);
+        }
+
+        // "[disabled] if (cond) return "action";" -> a disabled rule, or null when the text
+        // is not such a line (then it stays an ordinary comment).
+        private static Rule ParseDisabledRule(Comment c)
+        {
+            if (c.Block || !c.Text.StartsWith("[disabled]", StringComparison.Ordinal)) return null;
+            string code = c.Text.Substring("[disabled]".Length).Trim();
+            try
+            {
+                Program p = JsParser.ParseSource(code);
+                if (p.Body.Count != 1 || p.Comments.Count != 0) return null;
+                IfStatement ifs = p.Body[0] as IfStatement;
+                if (ifs == null || ifs.Else != null) return null;
+                Recognizer sub = new Recognizer(code, p);
+                string ret = sub.SimpleReturnString(ifs.Then);
+                if (ret == null) return null;
+                Rule r = new Rule();
+                r.Condition = sub.MapCondition(ifs.Test);
+                r.Action = ActionText.Parse(ret);
+                r.Enabled = false;
+                return r;
+            }
+            catch (ParseError) { return null; }
+            catch (LexError) { return null; }
+            catch (RecognizeException) { return null; }
+        }
+
+        // Lines PacGenerator writes on every save; reading them back as user comments would
+        // duplicate them on each round trip.
+        private static bool IsGeneratorMarker(Comment c)
+        {
+            string t = c.Text;
+            if (c.Block) return t.StartsWith("unparsed (", StringComparison.Ordinal);
+            return t.StartsWith("PAC file generated by WPAD File Manager", StringComparison.Ordinal) ||
+                   t.StartsWith("RuleSet: ", StringComparison.Ordinal) ||
+                   t.StartsWith("Generated: ", StringComparison.Ordinal) ||
+                   t.StartsWith("[preserved from import]", StringComparison.Ordinal);
+        }
+
+        private static bool InsideAny(Comment c, List<Node> nodes)
+        {
+            for (int i = 0; i < nodes.Count; i++)
+                if (c.Start >= nodes[i].Start && c.End <= nodes[i].End) return true;
+            return false;
+        }
+
+        private static string Join(List<string> parts)
+        {
+            List<string> lines = new List<string>();
+            for (int i = 0; i < parts.Count; i++)
+                if (!string.IsNullOrEmpty(parts[i])) lines.Add(parts[i]);
+            return lines.Count > 0 ? string.Join("\n", lines.ToArray()) : null;
         }
 
         // then-branch is a return of a string literal, possibly wrapped in a 1-statement block.
@@ -222,39 +378,28 @@ namespace WpadManager.Core.Parser
             throw new RecognizeException(expr.GetType().Name + " is not a PAC predicate");
         }
 
+        // "a || b || c ..." parses as a left-deep tree as deep as the list is long (a real
+        // corporate PAC can list tens of thousands of domains), so flatten it with an explicit
+        // stack rather than recursion, which would overflow the stack.
         private void FlattenLogical(LogicalExpr lg, CompositeOp op, List<Condition> outList)
         {
             string want = op == CompositeOp.And ? "&&" : "||";
-            AddSide(lg.Left, want, op, outList);
-            AddSide(lg.Right, want, op, outList);
-        }
-
-        private void AddSide(Node side, string want, CompositeOp op, List<Condition> outList)
-        {
-            LogicalExpr inner = side as LogicalExpr;
-            if (inner != null && inner.Op == want)
-                FlattenLogical(inner, op, outList);
-            else
-                outList.Add(MapCondition(side));
-        }
-
-        private string LeadingComment(int stmtLine)
-        {
-            string best = null;
-            int bestLine = -1;
-            for (int i = 0; i < _prog.Comments.Count; i++)
+            Stack<Node> pending = new Stack<Node>();
+            pending.Push(lg);
+            while (pending.Count > 0)
             {
-                Comment c = _prog.Comments[i];
-                if (c.Line == stmtLine - 1 && c.Line > bestLine)
+                Node side = pending.Pop();
+                LogicalExpr inner = side as LogicalExpr;
+                if (inner != null && inner.Op == want)
                 {
-                    best = c.Text;
-                    bestLine = c.Line;
+                    pending.Push(inner.Right);   // left is handled first, keeping source order
+                    pending.Push(inner.Left);
                 }
+                else outList.Add(MapCondition(side));
             }
-            return best;
         }
 
-        private void AddUnparsed(RuleSet rs, Node n, string reason)
+        private UnparsedBlock AddUnparsed(RuleSet rs, Node n, string reason)
         {
             UnparsedBlock ub = new UnparsedBlock();
             ub.Id = NewId();
@@ -267,6 +412,7 @@ namespace WpadManager.Core.Parser
             ub.SourceLineEnd = n.EndLine;
             ub.Reason = reason;
             rs.Unparsed.Add(ub);
+            return ub;
         }
 
         // Extract the verbatim source text spanned by a node (used to preserve

@@ -21,20 +21,35 @@ rules visible, checks them, and keeps a per-file history so changes are safe and
 
 ## Features
 
-- Import / export real `.pac` / `.dat` files with lossless round-trip (unknown blocks kept verbatim).
-- Structured rule table instead of raw JavaScript; add / edit / delete / enable / disable rules.
+- Import / export real `.pac` / `.dat` files with lossless round-trip: disabled rules, all
+  comments and statements the tool does not model come back in place, and the file keeps
+  its encoding (UTF-8, with or without BOM, or a legacy code page such as Windows-1251).
+- Structured rule table instead of raw JavaScript; add / edit / delete / enable / disable
+  rules and **move them up / down** (right-click menu, `Ctrl+↑` / `Ctrl+↓`).
 - Editable **default action** (the final fall-through `return`).
 - Condition & action **builder** — type a domain, URL pattern, subnet or proxy; the
   PAC expression is generated for you (and stays hand-editable).
-- **Validation** in three passes: security (forbids `eval`, host-object access, unknown calls),
-  structure (unknown functions with suggestions, argument counts, IP/mask, port ranges,
-  unreachable code), and **shadowing** (unreachable / duplicate / conflicting rules).
-  A file with warnings or errors **cannot be saved or simulated**.
+- **Validation** in three passes: security (forbids `eval`/`Function`/host objects,
+  prototype-chain escapes, redefinition of PAC built-ins, DNS lookups of computed names,
+  unknown calls and JS constructs the parser cannot vet), structure (unknown functions with
+  suggestions, argument counts, IP/mask, port ranges, unreachable code), and **shadowing**
+  (unreachable / duplicate / conflicting rules). Every write — save, export, restore from
+  history, CLI export — goes through one gate that vets the exact text being written; a file
+  with warnings or errors **cannot be saved, exported, written back by a history restore, or simulated**.
 - **Duplicate / overlap warning** when adding a rule already covered by an existing one.
 - **Simulator** — three-valued (true / false / unknown) evaluation of a URL against the
   rules, with a per-rule trace. No JavaScript executed, no network needed.
-- **DNS check** — resolve the domains used in rules to spot stale entries.
+- **DNS check** — resolve the domains used in rules to spot stale entries (in the background).
 - **Per-file version history** with restore; **multiple files open at once** without re-importing.
+  Histories live in a `history` folder next to the `.exe` (Settings → History folder to pick
+  another, e.g. one shared by the admins) — deliberately **not** next to the PAC file, whose
+  folder is usually the web server's, where anyone could download old rules and admin names.
+  History files found next to a PAC (older versions kept them there) are moved automatically.
+- **Safe saving** — writes are atomic (a failed save never leaves a truncated `wpad.dat`
+  behind); the tool warns before overwriting a file someone else changed on disk, merges
+  the history when two admins save the same file, sets a damaged history file aside instead
+  of failing, and marks unsaved changes (`*`) and asks before discarding them.
+- **Light / dark theme** (Settings → Theme; "Match Windows" follows the system setting).
 - Headless **CLI** for batch validation in CI / deployment scripts.
 
 ## Requirements
@@ -45,7 +60,8 @@ rules visible, checks them, and keeps a per-file history so changes are safe and
 
 ## Quick start
 
-Run the app from any **writable** folder (it stores its workspace next to the `.exe`):
+Run the app from any **writable** folder (it stores its workspace and, by default, the
+version history next to the `.exe`):
 
 ```
 WpadManager.exe
@@ -59,7 +75,7 @@ press **Check**, and **Save to file**.
 ```
 WpadManager.exe --validate <file.pac>             # safety + structure + shadowing; exit 1 on errors
 WpadManager.exe --simulate <file> <url> <host>    # route trace and result
-WpadManager.exe --export <store.json> <out.pac>   # export rules from a JSON store
+WpadManager.exe --export <store.json> <out.pac>   # export rules from a JSON store; exit 1 (nothing written) on errors
 WpadManager.exe --help
 ```
 

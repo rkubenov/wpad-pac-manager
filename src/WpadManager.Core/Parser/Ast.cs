@@ -81,7 +81,8 @@ namespace WpadManager.Core.Parser
     public class MemberExpr : Node
     {
         public Node Obj;
-        public string Prop;
+        public string Prop;   // property name for a.b; "[]" for a computed a[expr]
+        public Node Index;    // the expr of a computed a[expr]; null for a.b
     }
 
     public class LogicalExpr : Node

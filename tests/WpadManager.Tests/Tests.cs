@@ -35,6 +35,8 @@ namespace WpadManager.Tests
             ParseAndRecognize();
             Console.WriteLine("== Round-trip ==");
             RoundTrip();
+            Console.WriteLine("== Round-trip fidelity ==");
+            RoundTripFidelity();
             Console.WriteLine("== Edge cases ==");
             EdgeCases();
             Console.WriteLine("== JSON ==");
@@ -43,10 +45,20 @@ namespace WpadManager.Tests
             Validation();
             Console.WriteLine("== Safety ==");
             SafetyChecks();
+            Console.WriteLine("== Security hardening ==");
+            SecurityHardeningChecks();
+            Console.WriteLine("== Write gate ==");
+            GateChecks();
+            Console.WriteLine("== Parser limits ==");
+            ParserLimitChecks();
+            Console.WriteLine("== Files: encoding / atomic write / history recovery ==");
+            FileChecks();
             Console.WriteLine("== Shadowing ==");
             ShadowingChecks();
             Console.WriteLine("== Simulator ==");
             SimulatorChecks();
+            Console.WriteLine("== Analysis accuracy ==");
+            AnalysisAccuracyChecks();
             Console.WriteLine("== Storage ==");
             StorageChecks();
             Console.WriteLine("== Duplicate guard / DNS names ==");
@@ -121,12 +133,90 @@ namespace WpadManager.Tests
             Check(res2.RuleSet.Rules[0].Condition.Negate, "rt negation survives round-trip");
             Eq("10.0.0.0", res2.RuleSet.Rules[1].Condition.Args[0], "rt isInNet arg survives");
 
-            // disabled rule round-trips as a commented (inert) line
+            // disabled rule round-trips as a commented (inert) line — and comes back as a
+            // disabled rule when the file is opened again
             res.RuleSet.Rules[1].Enabled = false;
             string outPac2 = PacGenerator.Generate(res.RuleSet);
             Check(outPac2.Contains("[disabled]"), "disabled rule commented");
+            Check(Safety.Analyze(outPac2).Findings.Count == 0, "disabled rule is inert text for the browser");
             PacImportResult res3 = PacImporter.Import(outPac2);
-            Eq(1, res3.RuleSet.Rules.Count, "disabled rule not active after round-trip");
+            Eq(2, res3.RuleSet.Rules.Count, "disabled rule is back after round-trip");
+            Check(res3.RuleSet.Rules[0].Enabled && !res3.RuleSet.Rules[1].Enabled, "disabled rule stays disabled");
+            Eq("10.0.0.0", res3.RuleSet.Rules[1].Condition.Args[0], "disabled rule keeps its condition");
+        }
+
+        // Opening a saved file again must give back what was saved: disabled rules, every
+        // comment, and statements the recognizer does not model — in their original place.
+        static void RoundTripFidelity()
+        {
+            string pac =
+                "// Corporate PAC\n" +
+                "// owner: network team\n" +
+                "function helper(h) { return isPlainHostName(h); }\n" +
+                "\n" +
+                "function FindProxyForURL(url, host) {\n" +
+                "    // --- internal ---\n" +
+                "\n" +
+                "    // plain names\n" +
+                "    // go direct\n" +
+                "    if (isPlainHostName(host)) return \"DIRECT\";   // fast path\n" +
+                "    if (dnsDomainIs(host, \".a.example.com\") ||   // team A\n" +
+                "        dnsDomainIs(host, \".b.example.com\"))     // team B\n" +
+                "        return \"PROXY p.example.com:3128\";\n" +
+                "    // odd one out\n" +
+                "    if (host == \"legacy\") return \"PROXY old.example.com:8080\";\n" +
+                "    // [disabled] if (dnsDomainIs(host, \".c.example.com\")) return \"DIRECT\";\n" +
+                "    if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" +
+                "    // everyone else\n" +
+                "    return \"PROXY main.example.com:3128\";\n" +
+                "    if (isPlainHostName(host)) return \"PROXY never.example.com:1\";\n" +
+                "}\n";
+
+            RuleSet rs = Imported(pac);
+            Eq(4, rs.Rules.Count, "fidelity: 3 rules + 1 disabled");
+            Eq("--- internal ---\nplain names\ngo direct\nfast path", rs.Rules[0].Comment, "fidelity: all comments of rule 0");
+            Eq("team A\nteam B", rs.Rules[1].Comment, "fidelity: comments inside a multi-line condition");
+            Check(!rs.Rules[2].Enabled && rs.Rules[2].Condition.Args[0] == ".c.example.com", "fidelity: disabled rule recognized");
+            Check(rs.Rules[3].Comment == null, "fidelity: a [disabled] line is not the next rule's comment");
+            Eq("Corporate PAC\nowner: network team", rs.HeaderComment, "fidelity: file header comment");
+            Eq("everyone else", rs.DefaultComment, "fidelity: comment on the default return");
+
+            string gen = PacGenerator.Generate(rs);
+            int ruleA = gen.IndexOf(".b.example.com");
+            int odd = gen.IndexOf("host == \"legacy\"");
+            int ruleExample = gen.IndexOf("dnsDomainIs(host, \".example.com\")");
+            int defaultReturn = gen.IndexOf("return \"PROXY main.example.com:3128\"");
+            int unreachable = gen.IndexOf("never.example.com");
+            Check(ruleA < odd && odd < ruleExample, "fidelity: unrecognized statement keeps its place between rules");
+            Check(defaultReturn < unreachable, "fidelity: unreachable code stays after the default return");
+            Check(gen.Contains("// odd one out"), "fidelity: comment of an unrecognized statement kept");
+
+            // The simulator cannot evaluate the preserved statement, so a match after it is
+            // flagged as uncertain rather than presented as certain.
+            SimResult sim = Simulator.Run(rs, new SimInput("http://www.example.com/", "www.example.com"));
+            Check(sim.Matched != null && sim.Matched.Order == 3 && sim.HasIndeterminateBeforeMatch,
+                "fidelity: simulator flags preserved code before the match");
+
+            // Saving again changes nothing (apart from the timestamp line).
+            string again = PacGenerator.Generate(Imported(gen));
+            Eq(StripTimestamp(gen), StripTimestamp(again), "fidelity: generate(import(generated)) is stable");
+
+            // Deleting the rule an unrecognized statement was anchored to keeps it in place
+            // relative to its neighbours.
+            RuleSet del = Imported(pac);
+            del.RemoveRuleAt(2);   // the disabled rule right after "odd one out"
+            string delGen = PacGenerator.Generate(del);
+            Check(delGen.IndexOf("host == \"legacy\"") < delGen.IndexOf("dnsDomainIs(host, \".example.com\")"),
+                "fidelity: deleting a neighbour keeps the statement's place");
+        }
+
+        static string StripTimestamp(string pac)
+        {
+            string[] lines = pac.Split('\n');
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            for (int i = 0; i < lines.Length; i++)
+                if (!lines[i].StartsWith("// Generated:")) sb.Append(lines[i]).Append('\n');
+            return sb.ToString();
         }
 
         static void EdgeCases()
@@ -328,6 +418,279 @@ namespace WpadManager.Tests
             Check(Has(Safety.Analyze(typo), "SEC_UNKNOWN_CALL"), "unknown helper call flagged");
         }
 
+        // Regression tests for the 2026-09 security review: places where the parser saw a
+        // different program than a browser would run (so code slipped past the Safety pass),
+        // and stored text that could break out of a comment or string when regenerated.
+        static void SecurityHardeningChecks()
+        {
+            string head = "function FindProxyForURL(url, host) {\n";
+            string tail = "  return \"DIRECT\";\n}\n";
+
+            // Code inside a computed member index is part of the AST and gets vetted.
+            Report idx = Safety.Analyze("var x = host[eval(\"1\")];\n" + head + tail);
+            Check(Has(idx, "SEC_DANGEROUS_CALL") && idx.HasErrors, "eval inside [ ] is flagged");
+
+            // Overriding a PAC built-in, or aliasing a dangerous global, is flagged.
+            Report ovr = Safety.Analyze("dnsResolve = eval;\n" + head + "  dnsResolve(\"1\");\n" + tail);
+            Check(Has(ovr, "SEC_BUILTIN_OVERRIDE") && ovr.HasErrors, "assigning to a PAC built-in is flagged");
+            Check(Has(ovr, "SEC_DANGEROUS_REF"), "bare reference to eval is flagged");
+            Check(Has(Safety.Analyze("function dnsDomainIs(h, d) { return true; }\n" + head + tail),
+                "SEC_BUILTIN_OVERRIDE"), "redefining a PAC built-in function is flagged");
+            Check(Has(Safety.Analyze("var isInNet = 1;\n" + head + tail), "SEC_BUILTIN_OVERRIDE"),
+                "var shadowing a PAC built-in is flagged");
+
+            // Prototype-chain escapes and `this`.
+            Check(Has(Safety.Analyze(head + "  var f = host[\"constructor\"];\n" + tail), "SEC_PROTO_ACCESS"),
+                "['constructor'] access is flagged");
+            Check(Has(Safety.Analyze(head + "  var f = url.constructor;\n" + tail), "SEC_PROTO_ACCESS"),
+                ".constructor access is flagged");
+            Check(Safety.Analyze(head + "  this.x = 1;\n" + tail).HasErrors, "access through `this` is an error");
+
+            // JS keywords the subset parser does not model cannot be vetted.
+            Report kw = Safety.Analyze(head + "  while (true) { }\n" + tail);
+            Check(Has(kw, "SEC_UNSUPPORTED") && kw.HasErrors, "unsupported keyword (while) is an error");
+
+            // CR, U+2028 and U+2029 end a // comment in JavaScript, so what follows is code.
+            Check(Has(Safety.Analyze(head + "  // note\reval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after CR in a // comment is vetted");
+            Check(Has(Safety.Analyze(head + "  // note\u2028eval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after U+2028 in a // comment is vetted");
+            Check(Has(Safety.Analyze(head + "  // note\u2029eval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after U+2029 in a // comment is vetted");
+            RuleSet crlf = Imported(head.Replace("\n", "\r\n") +
+                "  // note\r\n  if (isPlainHostName(host)) return \"DIRECT\";\r\n" + tail.Replace("\n", "\r\n"));
+            Check(crlf.Rules.Count == 1 && crlf.Rules[0].Comment == "note", "CRLF comment still attaches to its rule");
+
+            // A DNS lookup of a computed name can leak every visited host to an outside resolver.
+            Report exf = Safety.Analyze(head + "  if (isResolvable(host + \".x.example.net\")) return \"DIRECT\";\n" + tail);
+            Check(Has(exf, "SEC_DNS_COMPUTED") && exf.HasErrors, "DNS lookup of a computed name is an error");
+            Check(Has(exf, "SEC_NAME_BUILD"), "building a name from host is flagged");
+            Report okDns = Safety.Analyze(head +
+                "  if (isInNet(myIpAddress(), \"10.0.0.0\", \"255.0.0.0\")) return \"DIRECT\";\n" +
+                "  if (isInNet(dnsResolve(host), \"10.0.0.0\", \"255.0.0.0\")) return \"DIRECT\";\n" +
+                "  if (isResolvable(host)) return \"DIRECT\";\n" + tail);
+            Eq(0, okDns.Findings.Count, "ordinary DNS helpers produce no findings");
+
+            // String escapes decode like JavaScript; raw line breaks in strings are errors.
+            RuleSet hx = Imported(head + "  if (dnsDomainIs(host, \"\\x2eexample.com\")) return \"DIRECT\";\n" + tail);
+            Eq(".example.com", hx.Rules[0].Condition.Args[0], "\\x escape decoded");
+            RuleSet ux = Imported(head + "  if (dnsDomainIs(host, \"\\u002eexample.com\")) return \"DIRECT\";\n" + tail);
+            Eq(".example.com", ux.Rules[0].Condition.Args[0], "\\u escape decoded");
+            Check(!PacImporter.Import(head + "  if (dnsDomainIs(host, \"a\rb\")) return \"DIRECT\";\n" + tail).Ok,
+                "raw CR inside a string literal is a syntax error");
+
+            // Generator: stored text (e.g. from an edited .history.json) stays inert.
+            RuleSet rs = Imported(head + "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" + tail);
+            rs.Name = "n\nvar a = eval(\"1\");";
+            rs.Rules[0].Comment = "c\u2028var b = eval(\"2\");";
+            rs.Rules[0].Condition.Args[0] = ".example.com\u2028\r\n\"x";
+            UnparsedBlock top = new UnparsedBlock();
+            top.Reason = "Top-level x\rvar c = eval(\"3\");"; top.RawText = "";
+            rs.Unparsed.Add(top);
+            UnparsedBlock body = new UnparsedBlock();
+            body.Reason = "r */ var d = eval(\"4\"); /*"; body.RawText = "";
+            rs.Unparsed.Add(body);
+            string gen = PacGenerator.Generate(rs);
+            Eq(0, Safety.Analyze(gen).Findings.Count, "injected comment/string text stays inert in generated PAC");
+            PacImportResult back = PacImporter.Import(gen);
+            Check(back.Ok && back.RuleSet.Rules.Count == 1, "generated PAC re-imports with one rule");
+            Check(back.Ok && back.RuleSet.Rules[0].Condition.Args[0] == ".example.com\u2028\r\n\"x",
+                "string with line breaks and quotes round-trips exactly");
+
+            // A malformed subject / function name is an error and is never emitted as code.
+            RuleSet sub = Imported(head + "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" + tail);
+            sub.Rules[0].Condition.Subject = "host) || true || (host";
+            Check(Has(Validator.Validate(sub), "COND_BAD_SUBJECT"), "malformed subject is an error");
+            Check(!PacGenerator.Generate(sub).Contains("|| true ||"), "malformed subject is never emitted");
+            sub.Rules[0].Condition.Subject = "host";
+            sub.Rules[0].Condition.Fn = "x) || eval(\"1\") || (y";
+            Check(!PacGenerator.Generate(sub).Contains("eval"), "malformed function name is never emitted");
+        }
+
+        // Every path that writes a PAC (save, export, history restore, CLI export) goes
+        // through Gate.Check, which vets the exact text it returns for writing.
+        static void GateChecks()
+        {
+            string pac =
+                "function FindProxyForURL(url, host) {\n" +
+                "  if (isPlainHostName(host)) return \"DIRECT\";\n" +
+                "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" +
+                "  if (isInNet(myIpAddress(), \"10.10.0.0\", \"255.255.255.0\")) return \"PROXY a.example.com:3128; DIRECT\";\n" +
+                "  return \"PROXY main.example.com:3128; DIRECT\";\n" +
+                "}\n";
+
+            string text;
+            Report ok = Gate.Check(Imported(pac), out text);
+            Check(!Gate.IsBlocking(ok), "gate: clean rule set passes");
+            Check(text.Contains("function FindProxyForURL") && text.Contains("main.example.com:3128"),
+                "gate: returns the generated PAC text");
+            Check(Safety.Analyze(text).Findings.Count == 0, "gate: returned text is itself clean");
+
+            // A tampered snapshot is blocked, with the finding attributed to its rule.
+            RuleSet bad = Imported(pac);
+            bad.Rules[1].Condition.Subject = "eval(\"1\")";
+            Report br = Gate.Check(bad, out text);
+            Check(Gate.IsBlocking(br) && br.HasErrors, "gate: injected call blocks the write");
+            Finding hit = First(br, "SEC_DANGEROUS_CALL");
+            Check(hit != null && hit.Order == 1, "gate: security finding attributed to rule 1");
+
+            // Same, end to end through a history sidecar on disk (the rollback source).
+            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "wpad-gate-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".history.json");
+            try
+            {
+                Store st = new Store();
+                RuleStore.Commit(st, Imported(pac), "tester", "v1");
+                RuleStore.Save(tmp, st);
+                string json = System.IO.File.ReadAllText(tmp)
+                    .Replace("\"Subject\": \"host\"", "\"Subject\": \"host) || eval(\\\"1\\\") || (host\"");
+                System.IO.File.WriteAllText(tmp, json);
+
+                Store loaded = RuleStore.Load(tmp);
+                Check(RuleStore.Rollback(loaded, loaded.Versions[0].Id, "tester"), "gate: tampered version rolls back in memory");
+                Report rr = Gate.Check(loaded.Current, out text);
+                Check(Gate.IsBlocking(rr), "gate: tampered history version cannot be written");
+                Check(!text.Contains("eval"), "gate: tampered subject never reaches the PAC text");
+            }
+            finally
+            {
+                try { System.IO.File.Delete(tmp); } catch { }
+            }
+
+            // Info findings (valid narrow-before-broad exceptions) do not block.
+            Report info = new Report();
+            info.Add(Finding.Make(Severity.Info, "EXCEPTION", "x", null, 0));
+            Check(!Gate.IsBlocking(info), "gate: info-only report does not block");
+        }
+
+        // Hostile or merely huge input must fail cleanly, never with a StackOverflowException
+        // (which .NET cannot catch: the whole app would die, on every start if the file is
+        // in the workspace).
+        static void ParserLimitChecks()
+        {
+            string head = "function FindProxyForURL(url, host) {\n  if (";
+            string tail = ") return \"DIRECT\";\n  return \"DIRECT\";\n}\n";
+
+            PacImportResult parens = PacImporter.Import(head + new string('(', 5000) + "isPlainHostName(host)" +
+                new string(')', 5000) + tail);
+            Check(!parens.Ok && parens.SyntaxError.Contains("too deep"), "5000 nested parens: clean 'too deep' error");
+            PacImportResult nots = PacImporter.Import(head + new string('!', 5000) + "isPlainHostName(host)" + tail);
+            Check(!nots.Ok && nots.SyntaxError.Contains("too deep"), "5000 chained '!': clean 'too deep' error");
+            Check(Safety.Analyze(head + new string('(', 5000) + "x" + new string(')', 5000) + tail).HasErrors,
+                "security pass reports too-deep nesting as an error");
+
+            // A legitimately long domain list (left-deep || chain) must still work.
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(head);
+            for (int i = 0; i < 30000; i++)
+            {
+                if (i > 0) sb.Append(" ||\n    ");
+                sb.Append("dnsDomainIs(host, \".d").Append(i).Append(".example.com\")");
+            }
+            sb.Append(tail);
+            PacImportResult big = PacImporter.Import(sb.ToString());
+            Check(big.Ok && big.RuleSet.Rules.Count == 1 && big.RuleSet.Rules[0].Condition.Children.Count == 30000,
+                "30000-domain OR list imports as one rule");
+            string text;
+            Report rep = Gate.Check(big.RuleSet, out text);
+            Check(!Gate.IsBlocking(rep), "30000-domain OR list passes the write gate");
+
+            // JSON: deep nesting and broken escapes are format errors, not crashes.
+            bool deepFailed = false;
+            try { WpadManager.Core.Json.Json.Parse(new string('[', 100000) + new string(']', 100000)); }
+            catch (FormatException) { deepFailed = true; }
+            Check(deepFailed, "JSON nested 100000 deep: FormatException");
+            bool escFailed = false;
+            try { WpadManager.Core.Json.Json.Deserialize<Store>("{\"Versions\":[{\"Id\":\"\\u12"); }
+            catch (FormatException) { escFailed = true; }
+            Check(escFailed, "JSON with a truncated \\u escape: FormatException");
+        }
+
+        static string TempPath(string ext)
+        {
+            return System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "wpad-t-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ext);
+        }
+
+        static void FileChecks()
+        {
+            // Encoding: legacy ANSI (e.g. Windows-1251) files are detected and written back
+            // byte-for-byte; UTF-8 BOMs are kept; plain UTF-8 stays without a BOM.
+            byte[] ansi = new byte[] { (byte)'/', (byte)'/', (byte)' ', 0xC0, 0xC1, (byte)'\n' };
+            System.Text.Encoding enc;
+            string text = TextFile.Decode(ansi, out enc);
+            Check(!(enc is System.Text.UTF8Encoding), "non-UTF-8 bytes decode with the ANSI code page");
+            Check(BytesEqual(ansi, TextFile.Encode(text, enc)), "ANSI file re-encodes byte-for-byte");
+
+            byte[] bom = new byte[] { 0xEF, 0xBB, 0xBF, (byte)'x' };
+            string bomText = TextFile.Decode(bom, out enc);
+            Eq("x", bomText, "UTF-8 BOM is not part of the text");
+            Check(BytesEqual(bom, TextFile.Encode(bomText, enc)), "UTF-8 BOM is kept on write");
+
+            byte[] utf8 = System.Text.Encoding.UTF8.GetBytes("// Привет\n");
+            string u = TextFile.Decode(utf8, out enc);
+            Check(BytesEqual(utf8, TextFile.Encode(u, enc)), "BOM-less UTF-8 stays BOM-less");
+
+            // Text the ANSI page cannot hold falls back to UTF-8 rather than turning into '?'.
+            System.Text.Encoding cp1251 = System.Text.Encoding.GetEncoding(1251);
+            Check(TextFile.EncodingFor("// Привет", cp1251) == cp1251, "1251 kept when it can hold the text");
+            Check(TextFile.EncodingFor("// Сәлем", cp1251) is System.Text.UTF8Encoding,
+                "falls back to UTF-8 for characters 1251 lacks");
+
+            // Atomic write replaces content and leaves no temp files behind.
+            string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wpad-dir-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            System.IO.Directory.CreateDirectory(dir);
+            try
+            {
+                string f = System.IO.Path.Combine(dir, "wpad.dat");
+                TextFile.Write(f, "one", TextFile.Utf8NoBom);
+                string fp1 = TextFile.Fingerprint(f);
+                TextFile.Write(f, "two", TextFile.Utf8NoBom);
+                Eq("two", TextFile.Read(f), "atomic write replaces the content");
+                Eq(1, System.IO.Directory.GetFiles(dir).Length, "atomic write leaves no temp file");
+                Check(fp1 != TextFile.Fingerprint(f), "fingerprint changes with the content");
+                Check(TextFile.Fingerprint(System.IO.Path.Combine(dir, "missing")) == null, "fingerprint of a missing file is null");
+
+                // A corrupt history sidecar is moved aside, not fatal.
+                string side = System.IO.Path.Combine(dir, "wpad.dat.history.json");
+                System.IO.File.WriteAllText(side, "{\"Versions\":[{\"Id\":\"\\u12");
+                string movedTo;
+                Store rec = RuleStore.LoadOrRecover(side, out movedTo);
+                Check(rec != null && rec.Versions.Count == 0, "corrupt sidecar: loads as empty history");
+                Check(movedTo != null && System.IO.File.Exists(movedTo) && !System.IO.File.Exists(side),
+                    "corrupt sidecar: kept aside under a new name");
+                Store ok = RuleStore.LoadOrRecover(side, out movedTo);
+                Check(ok != null && movedTo == null, "missing sidecar: empty history, nothing moved");
+
+                // Two editors of the same file: saving merges the other's history instead of
+                // dropping it.
+                Store baseStore = new Store();
+                RuleStore.Commit(baseStore, new RuleSet(), "a", "base");
+                RuleStore.Save(side, baseStore);
+                Store alice = RuleStore.Load(side);
+                Store bob = RuleStore.Load(side);
+                RuleStore.Commit(alice, new RuleSet(), "alice", "from alice");
+                RuleStore.SaveMerged(side, alice);
+                RuleStore.Commit(bob, new RuleSet(), "bob", "from bob");
+                RuleStore.SaveMerged(side, bob);
+                Store merged = RuleStore.Load(side);
+                Eq(3, merged.Versions.Count, "merged history keeps base + alice + bob");
+                Check(merged.Versions[1].Note == "from alice" && merged.Versions[2].Note == "from bob",
+                    "merged history is in time order");
+                Eq(3, bob.Versions.Count, "the saving editor sees the merged history too");
+            }
+            finally
+            {
+                try { System.IO.Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
         static void ShadowingChecks()
         {
             // Broad domain before narrow => the narrow rule is unreachable (CRITICAL).
@@ -445,6 +808,65 @@ namespace WpadManager.Tests
             Check(f.Matched == null || f.Matched.Order != 0, "disabled rule 0 does not fire");
         }
 
+        // Analysis must agree with what browsers do (the Chrome / Firefox reference PAC
+        // helpers): a false "unreachable" blocks saving, a wrong simulation misleads.
+        static void AnalysisAccuracyChecks()
+        {
+            string h = "function FindProxyForURL(url, host) {\n";
+            string t = "  return \"DIRECT\";\n}\n";
+
+            // localHostOrDomainIs matches the full name or a leading part of it — not a suffix.
+            Report lh = Shadowing.Analyze(Imported(h +
+                "  if (localHostOrDomainIs(host, \"example.com\")) return \"DIRECT\";\n" +
+                "  if (localHostOrDomainIs(host, \"www.example.com\")) return \"PROXY p:1\";\n" + t));
+            Check(!Has(lh, "SHADOW"), "localHostOrDomainIs: no false 'unreachable'");
+            Report lh2 = Shadowing.Analyze(Imported(h +
+                "  if (localHostOrDomainIs(host, \"www.example.com\")) return \"DIRECT\";\n" +
+                "  if (localHostOrDomainIs(host, \"www\")) return \"PROXY p:1\";\n" + t));
+            Check(Has(lh2, "SHADOW"), "localHostOrDomainIs: 'www' is covered by 'www.example.com'");
+
+            // dnsDomainIs compares exactly: a mixed-case domain never matches a lower-case host.
+            Report dc = Shadowing.Analyze(Imported(h +
+                "  if (dnsDomainIs(host, \".EXAMPLE.com\")) return \"DIRECT\";\n" +
+                "  if (dnsDomainIs(host, \".a.example.com\")) return \"PROXY p:1\";\n" + t));
+            Check(!Has(dc, "SHADOW"), "dnsDomainIs: '.EXAMPLE.com' does not shadow '.a.example.com'");
+            Check(Has(Validator.Validate(Imported(h + "  if (dnsDomainIs(host, \".EXAMPLE.com\")) return \"DIRECT\";\n" + t)),
+                "DOMAIN_CASE"), "upper-case domain is flagged (never matches)");
+            Check(Has(Validator.Validate(Imported(h + "  if (dnsDomainIs(host, \"example.com\")) return \"DIRECT\";\n" + t)),
+                "DOMAIN_SUFFIX"), "domain without leading dot is noted (also matches notexample.com)");
+            Check(!Has(Validator.Validate(Imported(h + "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" + t)),
+                "DOMAIN_SUFFIX"), "'.example.com' is not noted");
+
+            // Simulator: the subject decides what is matched.
+            RuleSet sub = Imported(h +
+                "  if (shExpMatch(myIpAddress(), \"10.1.*\")) return \"PROXY branch:3128\";\n" +
+                "  if (shExpMatch(dnsResolve(host), \"10.*\")) return \"PROXY dc:3128\";\n" +
+                "  return \"PROXY main:3128\";\n}\n");
+            SimInput withIp = new SimInput("http://www.example.com/", "www.example.com");
+            withIp.MyIp = "10.1.2.3";
+            SimResult s1 = Simulator.Run(sub, withIp);
+            Check(s1.Matched != null && s1.Matched.Order == 0, "simulator: shExpMatch(myIpAddress()) uses the client IP");
+            SimResult s2 = Simulator.Run(sub, new SimInput("http://www.example.com/", "www.example.com"));
+            Check(s2.Trace[0].Result == Tri.Unknown && s2.Trace[1].Result == Tri.Unknown,
+                "simulator: unknown client IP / DNS result is indeterminate, not false");
+
+            // Simulator: case-sensitive like browsers; host lower-cased, URL path keeps its case.
+            RuleSet cs = Imported(h +
+                "  if (shExpMatch(url, \"*/Admin/*\")) return \"PROXY a:1\";\n" +
+                "  if (dnsDomainIs(host, \".EXAMPLE.com\")) return \"PROXY b:1\";\n" + t);
+            Check(Simulator.Run(cs, new SimInput("http://x.example.com/admin/", "x.example.com")).UsedDefault,
+                "simulator: shExpMatch is case-sensitive; an upper-case domain never matches");
+            SimResult up = Simulator.Run(cs, new SimInput("HTTP://X.Example.COM/Admin/", "X.Example.COM"));
+            Check(up.Matched != null && up.Matched.Order == 0, "simulator: scheme/host lower-cased, path case kept");
+
+            // Simulator: isResolvable needs DNS -> indeterminate unless the host is an IP.
+            RuleSet res = Imported(h + "  if (!isResolvable(host)) return \"DIRECT\";\n" + t);
+            Check(Simulator.Run(res, new SimInput("http://x.example.com/", "x.example.com")).Trace[0].Result == Tri.Unknown,
+                "simulator: isResolvable of a name is indeterminate");
+            Check(Simulator.Run(res, new SimInput("http://10.0.0.1/", "10.0.0.1")).Trace[0].Result == Tri.False,
+                "simulator: an IP literal is resolvable");
+        }
+
         static void StorageChecks()
         {
             string pacA =
@@ -529,12 +951,25 @@ namespace WpadManager.Tests
 
             List<string> da = new List<string>(); da.Add("test.example.com");
             Condition narrow = Condition.Single("dnsDomainIs", da, false); narrow.Subject = "host";
-            List<string> w1 = Shadowing.CheckCandidate(rs, narrow);
-            Check(w1.Count >= 1, "duplicate guard warns: test.example.com already covered by .example.com");
+            List<Overlap> w1 = Shadowing.CheckCandidate(rs, narrow);
+            Check(w1.Count == 1 && w1[0].Kind == OverlapKind.CoveredBy && w1[0].Order == 0,
+                "duplicate guard warns: test.example.com already covered by .example.com (rule 0)");
 
             List<string> db = new List<string>(); db.Add(".other.com");
             Condition unrelated = Condition.Single("dnsDomainIs", db, false); unrelated.Subject = "host";
             Check(Shadowing.CheckCandidate(rs, unrelated).Count == 0, "duplicate guard quiet for unrelated domain");
+
+            // Moving a rule fixes a broad-before-narrow shadow and renumbers.
+            RuleSet mv = Imported(
+                "function FindProxyForURL(url, host) {\n" +
+                "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" +
+                "  if (dnsDomainIs(host, \".a.example.com\")) return \"PROXY p:1\";\n" +
+                "  return \"DIRECT\";\n}\n");
+            Check(Has(Shadowing.Analyze(mv), "SHADOW"), "move: broad rule first shadows the narrow one");
+            Eq(0, mv.MoveRule(1, -1), "move: rule 1 moves up to index 0");
+            Check(!Has(Shadowing.Analyze(mv), "SHADOW") && mv.Rules[0].Order == 0 && mv.Rules[1].Order == 1,
+                "move: no shadow after moving, orders renumbered");
+            Eq(-1, mv.MoveRule(0, -1), "move: the first rule cannot move up");
 
             // DNS name extraction strips the leading dot and dedupes.
             string pac2 =
@@ -594,16 +1029,59 @@ namespace WpadManager.Tests
                 ws.OpenFiles.Add("C:\\a\\one.dat");
                 ws.OpenFiles.Add("C:\\b\\two.pac");
                 ws.ActiveFile = "C:\\b\\two.pac";
+                ws.Language = "en";
+                ws.Theme = "dark";
+                ws.HistoryDir = "D:\\hist";
                 RuleStore.SaveWorkspace(tmp, ws);
 
                 WorkspaceState back = RuleStore.LoadWorkspace(tmp);
                 Eq(2, back.OpenFiles.Count, "workspace: two open files round-trip");
                 Check(back.OpenFiles.Contains("C:\\a\\one.dat"), "workspace: first file kept");
                 Eq("C:\\b\\two.pac", back.ActiveFile, "workspace: active file kept");
+                Eq("en", back.Language, "workspace: language kept");
+                Eq("dark", back.Theme, "workspace: theme kept");
+                Eq("D:\\hist", back.HistoryDir, "workspace: history folder kept");
+
+                // A workspace written before themes existed loads with no theme (=> "system").
+                System.IO.File.WriteAllText(tmp, "{ \"OpenFiles\": [], \"Language\": \"ru\" }");
+                Check(RuleStore.LoadWorkspace(tmp).Theme == null, "workspace: old file has no theme");
             }
             finally
             {
                 try { System.IO.File.Delete(tmp); } catch { }
+            }
+
+            // History lives in a history folder, not next to the PAC (usually the web server's
+            // folder, where anyone could download it). One file per PAC path.
+            string hp = RuleStore.HistoryPath("C:\\inetpub\\wwwroot\\wpad.dat", "D:\\hist");
+            Check(hp.StartsWith("D:\\hist\\wpad.dat-") && hp.EndsWith(".history.json"), "history path: <dir>\\<name>-<hash>.history.json");
+            Eq(hp, RuleStore.HistoryPath("c:\\INETPUB\\wwwroot\\WPAD.dat", "D:\\hist"), "history path: same file, other case => same history");
+            Check(hp != RuleStore.HistoryPath("C:\\site2\\wpad.dat", "D:\\hist"), "history path: two files named wpad.dat stay apart");
+
+            // A history file found next to the PAC (the old place) moves into the history folder,
+            // merging with what is already there.
+            string mdir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wpad-mig-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            System.IO.Directory.CreateDirectory(mdir);
+            try
+            {
+                string pacFile = System.IO.Path.Combine(mdir, "wpad.dat");
+                System.IO.File.WriteAllText(pacFile, "");
+                string histDir = System.IO.Path.Combine(mdir, "history");     // does not exist yet
+                Store legacy = new Store();
+                RuleStore.Commit(legacy, new RuleSet(), "a", "old place");
+                RuleStore.Save(RuleStore.SidecarPath(pacFile), legacy);
+                Store already = new Store();
+                RuleStore.Commit(already, new RuleSet(), "b", "new place");
+                RuleStore.Save(RuleStore.HistoryPath(pacFile, histDir), already);   // creates the folder
+
+                Check(RuleStore.MigrateLegacySidecar(pacFile, histDir), "migration: reports a move");
+                Check(!System.IO.File.Exists(RuleStore.SidecarPath(pacFile)), "migration: nothing left next to the PAC");
+                Eq(2, RuleStore.Load(RuleStore.HistoryPath(pacFile, histDir)).Versions.Count, "migration: histories merged");
+                Check(!RuleStore.MigrateLegacySidecar(pacFile, histDir), "migration: nothing to do the second time");
+            }
+            finally
+            {
+                try { System.IO.Directory.Delete(mdir, true); } catch { }
             }
 
             // A missing workspace file loads as empty, not null.

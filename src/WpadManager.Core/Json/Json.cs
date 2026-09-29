@@ -25,20 +25,40 @@ namespace WpadManager.Core.Json
             return sb.ToString();
         }
 
+        // Deeper nesting than this is rejected: the parser is recursive and a stack overflow
+        // cannot be caught (the app would die on reading a hostile history file).
+        private const int MaxDepth = 256;
+
         // Generic parse -> Dictionary<string,object> / List<object> / string / double / bool / null.
+        // Any malformed input surfaces as FormatException.
         public static object Parse(string text)
         {
-            int i = 0;
-            object v = ParseValue(text, ref i);
-            SkipWs(text, ref i);
-            if (i != text.Length) throw new FormatException("Trailing characters in JSON at " + i);
-            return v;
+            try
+            {
+                int i = 0;
+                object v = ParseValue(text, ref i, 0);
+                SkipWs(text, ref i);
+                if (i != text.Length) throw new FormatException("Trailing characters in JSON at " + i);
+                return v;
+            }
+            catch (FormatException) { throw; }
+            catch (ArgumentException ex) { throw new FormatException("Invalid JSON: " + ex.Message, ex); }
+            catch (IndexOutOfRangeException ex) { throw new FormatException("Invalid JSON: unexpected end", ex); }
+            catch (OverflowException ex) { throw new FormatException("Invalid JSON: " + ex.Message, ex); }
         }
 
+        // Typed conversion; a document whose shape does not fit T is a FormatException too.
         public static T Deserialize<T>(string text)
         {
             object graph = Parse(text);
-            return (T)ConvertTo(graph, typeof(T));
+            try
+            {
+                return (T)ConvertTo(graph, typeof(T));
+            }
+            catch (FormatException) { throw; }
+            catch (InvalidCastException ex) { throw new FormatException("JSON does not match " + typeof(T).Name + ": " + ex.Message, ex); }
+            catch (ArgumentException ex) { throw new FormatException("JSON does not match " + typeof(T).Name + ": " + ex.Message, ex); }
+            catch (OverflowException ex) { throw new FormatException("JSON does not match " + typeof(T).Name + ": " + ex.Message, ex); }
         }
 
         // ---------- Writer ----------
@@ -188,20 +208,21 @@ namespace WpadManager.Core.Json
             }
         }
 
-        private static object ParseValue(string s, ref int i)
+        private static object ParseValue(string s, ref int i, int depth)
         {
             SkipWs(s, ref i);
             if (i >= s.Length) throw new FormatException("Unexpected end of JSON");
+            if (depth > MaxDepth) throw new FormatException("JSON is nested too deep (more than " + MaxDepth + " levels)");
             char c = s[i];
-            if (c == '{') return ParseObject(s, ref i);
-            if (c == '[') return ParseArray(s, ref i);
+            if (c == '{') return ParseObject(s, ref i, depth + 1);
+            if (c == '[') return ParseArray(s, ref i, depth + 1);
             if (c == '"') return ParseString(s, ref i);
             if (c == 't' || c == 'f') return ParseBool(s, ref i);
             if (c == 'n') { Expect(s, ref i, "null"); return null; }
             return ParseNumber(s, ref i);
         }
 
-        private static Dictionary<string, object> ParseObject(string s, ref int i)
+        private static Dictionary<string, object> ParseObject(string s, ref int i, int depth)
         {
             Dictionary<string, object> d = new Dictionary<string, object>();
             i++; // {
@@ -214,7 +235,7 @@ namespace WpadManager.Core.Json
                 SkipWs(s, ref i);
                 if (i >= s.Length || s[i] != ':') throw new FormatException("Expected ':' at " + i);
                 i++;
-                object val = ParseValue(s, ref i);
+                object val = ParseValue(s, ref i, depth);
                 d[key] = val;
                 SkipWs(s, ref i);
                 if (i >= s.Length) throw new FormatException("Unterminated object");
@@ -225,7 +246,7 @@ namespace WpadManager.Core.Json
             return d;
         }
 
-        private static List<object> ParseArray(string s, ref int i)
+        private static List<object> ParseArray(string s, ref int i, int depth)
         {
             List<object> list = new List<object>();
             i++; // [
@@ -233,7 +254,7 @@ namespace WpadManager.Core.Json
             if (i < s.Length && s[i] == ']') { i++; return list; }
             while (true)
             {
-                object val = ParseValue(s, ref i);
+                object val = ParseValue(s, ref i, depth);
                 list.Add(val);
                 SkipWs(s, ref i);
                 if (i >= s.Length) throw new FormatException("Unterminated array");

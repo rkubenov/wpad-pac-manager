@@ -6,6 +6,21 @@ using WpadManager.Core.Generator;
 
 namespace WpadManager.Core.Analyze
 {
+    public enum OverlapKind
+    {
+        SameAs,      // same match set: the new rule would never fire (or duplicates)
+        CoveredBy,   // the existing rule already matches all of it: the new rule never fires
+        Covers       // the new rule is broader; the existing rule still fires first for its part
+    }
+
+    // How a candidate rule relates to one existing rule (see Shadowing.CheckCandidate).
+    public class Overlap
+    {
+        public OverlapKind Kind;
+        public int Order;          // the existing rule
+        public string Condition;   // its condition, as PAC text
+    }
+
     // Order-aware overlap / shadowing detection.
     //
     // Rules are evaluated top-to-bottom and the FIRST matching rule wins. So if an
@@ -83,12 +98,13 @@ namespace WpadManager.Core.Analyze
             return report;
         }
 
-        // Pre-add check: compare a candidate condition against existing enabled rules and
-        // return human-readable overlap warnings. Used to warn an engineer that a new rule
-        // (e.g. "test.example.com") is already covered by an existing one (e.g. ".example.com").
-        public static List<string> CheckCandidate(RuleSet rs, Condition candidate)
+        // Pre-add check: how a candidate condition (to be appended as the last rule) relates
+        // to each existing enabled rule. Used to warn an engineer that a new rule (e.g.
+        // "test.example.com") is already covered by an existing one (e.g. ".example.com").
+        // The UI turns these into text in its own language.
+        public static List<Overlap> CheckCandidate(RuleSet rs, Condition candidate)
         {
-            List<string> outp = new List<string>();
+            List<Overlap> outp = new List<Overlap>();
             if (rs == null || candidate == null) return outp;
             for (int i = 0; i < rs.Rules.Count; i++)
             {
@@ -96,13 +112,16 @@ namespace WpadManager.Core.Analyze
                 if (!r.Enabled || r.Condition == null) continue;
                 bool candInExisting = Subset(candidate, r.Condition); // candidate ⊆ existing
                 bool existingInCand = Subset(r.Condition, candidate);  // existing ⊆ candidate
-                string desc = PacGenerator.GenCondition(r.Condition);
-                if (candInExisting && existingInCand)
-                    outp.Add("точно совпадает с правилом " + r.Order + ": " + desc);
-                else if (candInExisting)
-                    outp.Add("уже покрывается правилом " + r.Order + ": " + desc);
-                else if (existingInCand)
-                    outp.Add("шире правила " + r.Order + " (" + desc + ") — оно станет недостижимым");
+                OverlapKind kind;
+                if (candInExisting && existingInCand) kind = OverlapKind.SameAs;
+                else if (candInExisting) kind = OverlapKind.CoveredBy;
+                else if (existingInCand) kind = OverlapKind.Covers;
+                else continue;
+                Overlap o = new Overlap();
+                o.Kind = kind;
+                o.Order = r.Order;
+                o.Condition = PacGenerator.GenCondition(r.Condition);
+                outp.Add(o);
             }
             return outp;
         }
@@ -188,10 +207,17 @@ namespace WpadManager.Core.Analyze
             switch (a.Fn)
             {
                 case "dnsDomainIs":
-                case "localHostOrDomainIs":
-                    // host matching suffix av also matches suffix bv iff av ends with bv.
+                    // Suffix match, compared exactly (browsers pass the host in lower case):
+                    // every host ending with av also ends with bv iff av ends with bv.
                     if (av == null || bv == null) return false;
-                    return EndsWithCI(av, bv);
+                    return av.EndsWith(bv, StringComparison.Ordinal);
+
+                case "localHostOrDomainIs":
+                    // Matches the full name hd, or a leading part of it ending at a dot
+                    // ("www" for "www.example.com") — NOT a suffix. The set for av lies inside
+                    // the set for bv iff av is bv or a leading part of it.
+                    if (av == null || bv == null) return false;
+                    return av == bv || bv.StartsWith(av + ".", StringComparison.Ordinal);
 
                 case "shExpMatch":
                     if (av == null || bv == null) return false;
@@ -258,11 +284,6 @@ namespace WpadManager.Core.Analyze
         {
             if (c.Args == null || i >= c.Args.Count) return null;
             return c.Args[i];
-        }
-
-        private static bool EndsWithCI(string s, string suffix)
-        {
-            return s.EndsWith(suffix, StringComparison.OrdinalIgnoreCase);
         }
     }
 }

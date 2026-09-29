@@ -17,7 +17,22 @@ namespace WpadManager.Core.Parser
         private readonly List<Token> _t;
         private int _p;
 
+        // Syntactic nesting (blocks, parentheses, unary operators, call arguments) deeper
+        // than this is a parse error. Real PAC files nest a handful of levels; without a cap
+        // a crafted file would overflow the stack, which .NET cannot catch. Long flat lists
+        // such as "a || b || c ..." are parsed iteratively and do not count.
+        private const int MaxDepth = 200;
+        private int _depth;
+
         public JsParser(List<Token> tokens) { _t = tokens; _p = 0; }
+
+        private void Enter()
+        {
+            if (++_depth > MaxDepth)
+                throw new ParseError("Nesting is too deep (more than " + MaxDepth + " levels)", Cur.Start, Cur.Line);
+        }
+
+        private void Leave() { _depth--; }
 
         public static Program ParseSource(string source)
         {
@@ -27,6 +42,23 @@ namespace WpadManager.Core.Parser
             Program prog = parser.ParseProgram();
             prog.Comments = lex.Comments;
             return prog;
+        }
+
+        // True when `text` is exactly one operand — an identifier (host), a call
+        // (myIpAddress(), dnsResolve(host)) or a member access — and nothing else: no second
+        // statement, no operators, no comments. Used to vet a condition's Subject before it
+        // is written back out as code, since a stored model can be hand-edited.
+        public static bool IsSimpleOperand(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return false;
+            Program p;
+            try { p = ParseSource(text); }
+            catch (ParseError) { return false; }
+            catch (LexError) { return false; }
+            if (p.Body.Count != 1 || p.Comments.Count != 0) return false;
+            ExpressionStatement es = p.Body[0] as ExpressionStatement;
+            if (es == null || es.End != es.Expr.End) return false;   // no trailing ';'
+            return es.Expr is Identifier || es.Expr is CallExpr || es.Expr is MemberExpr;
         }
 
         private Token Cur { get { return _t[_p]; } }
@@ -64,6 +96,14 @@ namespace WpadManager.Core.Parser
         }
 
         private Node ParseStatement()
+        {
+            Enter();
+            Node n = ParseStatementInner();
+            Leave();
+            return n;
+        }
+
+        private Node ParseStatementInner()
         {
             if (IsPunc(";")) { Next(); return null; }
             if (IsPunc("{")) return ParseBlock();
@@ -180,13 +220,15 @@ namespace WpadManager.Core.Parser
 
         private Node ParseAssignment()
         {
+            Enter();
             Node left = ParseConditional();
             if (IsPunc("=") || IsPunc("+=") || IsPunc("-=") || IsPunc("*=") || IsPunc("/="))
             {
                 string op = Next().Text;
                 Node right = ParseAssignment();
-                return MakeBinary(op, left, right);
+                left = MakeBinary(op, left, right);
             }
+            Leave();
             return left;
         }
 
@@ -284,7 +326,9 @@ namespace WpadManager.Core.Parser
             if (IsPunc("!") || IsPunc("-") || IsPunc("+"))
             {
                 Token op = Next();
+                Enter();
                 Node arg = ParseUnary();
+                Leave();
                 UnaryExpr u = new UnaryExpr();
                 u.Op = op.Text; u.Arg = arg;
                 u.Start = op.Start; u.Line = op.Line; u.End = arg.End; u.EndLine = arg.EndLine;
@@ -327,12 +371,13 @@ namespace WpadManager.Core.Parser
                 }
                 else if (IsPunc("["))
                 {
-                    // index access: parse and fold into a member-ish node (rare in PAC)
+                    // index access (rare in PAC). The index expression MUST stay in the AST:
+                    // dropping it would hide e.g. host[eval("...")] from the Safety pass.
                     Next();
-                    ParseExpression();
+                    Node index = ParseExpression();
                     Token close = Expect("]");
                     MemberExpr m = new MemberExpr();
-                    m.Obj = node; m.Prop = "[]";
+                    m.Obj = node; m.Prop = "[]"; m.Index = index;
                     m.Start = node.Start; m.Line = node.Line; m.End = close.End; m.EndLine = close.Line;
                     node = m;
                 }

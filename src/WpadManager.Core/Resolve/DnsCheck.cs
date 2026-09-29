@@ -10,27 +10,32 @@ namespace WpadManager.Core.Resolve
         public string Name;
         public bool Ok;
         public List<string> Addresses = new List<string>();
-        public string Error;
+        public bool TimedOut;    // no answer within the timeout
+        public bool NoRecords;   // answered, but without addresses
+        public string Error;     // resolver error text, when neither of the above
     }
 
     // Resolves the domain names referenced by rules through the system DNS resolver
     // (pointed at corporate DNS), with a per-name timeout and an in-memory cache so a
     // re-check is instant. Used to flag rules whose domain no longer resolves (stale).
+    // Thread-safe: the UI resolves several names in parallel off the UI thread.
     public static class DnsCheck
     {
+        private static readonly object _lock = new object();
         private static readonly Dictionary<string, DnsResult> _cache =
             new Dictionary<string, DnsResult>(StringComparer.OrdinalIgnoreCase);
 
-        public static void ClearCache() { _cache.Clear(); }
+        public static void ClearCache() { lock (_lock) _cache.Clear(); }
 
         public static DnsResult Resolve(string name, int timeoutMs)
         {
             DnsResult cached;
-            if (name != null && _cache.TryGetValue(name, out cached)) return cached;
+            lock (_lock)
+                if (name != null && _cache.TryGetValue(name, out cached)) return cached;
 
             DnsResult res = new DnsResult();
             res.Name = name;
-            if (string.IsNullOrEmpty(name)) { res.Ok = false; res.Error = "пустое имя"; return res; }
+            if (string.IsNullOrEmpty(name)) { res.Ok = false; res.NoRecords = true; return res; }
 
             try
             {
@@ -38,14 +43,14 @@ namespace WpadManager.Core.Resolve
                 if (!ar.AsyncWaitHandle.WaitOne(timeoutMs))
                 {
                     res.Ok = false;
-                    res.Error = "таймаут (" + timeoutMs + " мс)";
+                    res.TimedOut = true;
                 }
                 else
                 {
                     IPAddress[] ips = Dns.EndGetHostAddresses(ar);
                     for (int i = 0; i < ips.Length; i++) res.Addresses.Add(ips[i].ToString());
                     res.Ok = res.Addresses.Count > 0;
-                    if (!res.Ok) res.Error = "нет записей";
+                    res.NoRecords = !res.Ok;
                 }
             }
             catch (Exception ex)
@@ -53,7 +58,7 @@ namespace WpadManager.Core.Resolve
                 res.Ok = false;
                 res.Error = ex.Message;
             }
-            _cache[name] = res;
+            lock (_lock) _cache[name] = res;
             return res;
         }
 

@@ -121,7 +121,7 @@ namespace WpadManager.Core.Model
         public bool Enabled;
         public Condition Condition;
         public List<ProxyEntry> Action;   // fallback chain joined by ';'
-        public string Comment;            // round-trips as a // line above the rule
+        public string Comment;            // may span lines ('\n'); each round-trips as a // line above the rule
         public string Author;
         public string CreatedAt;          // ISO-8601 UTC
         public string UpdatedAt;
@@ -142,6 +142,9 @@ namespace WpadManager.Core.Model
         public int SourceLineStart;
         public int SourceLineEnd;
         public string Reason;
+        public string Comment;        // comments that preceded it (in-body blocks), '\n'-separated
+        public string BeforeRuleId;   // in-body: the rule it preceded, so it keeps its place; null = after all rules
+        public bool AfterDefault;     // in-body: it followed the default return (unreachable) and stays after it
     }
 
     // The container: an ordered list of rules + a default action (the trailing return),
@@ -154,6 +157,8 @@ namespace WpadManager.Core.Model
         public List<Rule> Rules;
         public List<ProxyEntry> DefaultAction;   // the final `return "..."`; default DIRECT
         public List<UnparsedBlock> Unparsed;
+        public string HeaderComment;             // file-level comments outside FindProxyForURL
+        public string DefaultComment;            // comments above the final return
         public string CreatedBy;
         public string CreatedAt;
         public string UpdatedAt;
@@ -164,6 +169,33 @@ namespace WpadManager.Core.Model
             DefaultAction = new List<ProxyEntry>();
             DefaultAction.Add(ProxyEntry.Direct());
             Unparsed = new List<UnparsedBlock>();
+        }
+
+        // Remove a rule, renumber the rest and keep preserved code in place: a block that sat
+        // right before the removed rule now sits before the rule that followed it.
+        public void RemoveRuleAt(int index)
+        {
+            Rule removed = Rules[index];
+            string next = index + 1 < Rules.Count ? Rules[index + 1].Id : null;
+            for (int i = 0; i < Unparsed.Count; i++)
+                if (Unparsed[i].BeforeRuleId != null && Unparsed[i].BeforeRuleId == removed.Id)
+                    Unparsed[i].BeforeRuleId = next;
+            Rules.RemoveAt(index);
+            for (int i = 0; i < Rules.Count; i++) Rules[i].Order = i;
+        }
+
+        // Swap a rule with its neighbour (delta -1 = up, +1 = down) and renumber. Preserved
+        // code anchored to a rule moves with it. Returns the rule's new index, or -1 if it
+        // cannot move that way.
+        public int MoveRule(int index, int delta)
+        {
+            int to = index + delta;
+            if (index < 0 || index >= Rules.Count || to < 0 || to >= Rules.Count) return -1;
+            Rule r = Rules[index];
+            Rules[index] = Rules[to];
+            Rules[to] = r;
+            for (int i = 0; i < Rules.Count; i++) Rules[i].Order = i;
+            return to;
         }
     }
 }
