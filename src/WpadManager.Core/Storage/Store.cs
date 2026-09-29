@@ -42,6 +42,7 @@ namespace WpadManager.Core.Storage
         public List<string> OpenFiles = new List<string>();
         public string ActiveFile;
         public string Language;   // UI language code: "ru" (default) or "en"
+        public string Theme;      // UI theme: "system" (default), "light" or "dark"
     }
 
     public class DiffResult

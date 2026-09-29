@@ -743,12 +743,20 @@ namespace WpadManager.Tests
                 ws.OpenFiles.Add("C:\\a\\one.dat");
                 ws.OpenFiles.Add("C:\\b\\two.pac");
                 ws.ActiveFile = "C:\\b\\two.pac";
+                ws.Language = "en";
+                ws.Theme = "dark";
                 RuleStore.SaveWorkspace(tmp, ws);
 
                 WorkspaceState back = RuleStore.LoadWorkspace(tmp);
                 Eq(2, back.OpenFiles.Count, "workspace: two open files round-trip");
                 Check(back.OpenFiles.Contains("C:\\a\\one.dat"), "workspace: first file kept");
                 Eq("C:\\b\\two.pac", back.ActiveFile, "workspace: active file kept");
+                Eq("en", back.Language, "workspace: language kept");
+                Eq("dark", back.Theme, "workspace: theme kept");
+
+                // A workspace written before themes existed loads with no theme (=> "system").
+                System.IO.File.WriteAllText(tmp, "{ \"OpenFiles\": [], \"Language\": \"ru\" }");
+                Check(RuleStore.LoadWorkspace(tmp).Theme == null, "workspace: old file has no theme");
             }
             finally
             {

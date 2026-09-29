@@ -26,20 +26,21 @@ namespace WpadManager.App
         private readonly List<Store> _docs = new List<Store>();
         private int _active = -1;
         private bool _suppressSelect = false;
-        private bool _suppressLang = false;
+        private bool _appliedDark = false;
         private readonly RuleSet _emptySet = new RuleSet();
 
         private DataGridView _grid;
         private ListBox _findings;
         private ToolStripStatusLabel _status;
         private ToolStripComboBox _files;
-        private ToolStripComboBox _lang;
 
         public MainForm()
         {
             _workspacePath = RuleStore.WorkspacePath();
-            // Language must be known before building the (localized) controls.
-            L.Set(RuleStore.LoadWorkspace(_workspacePath).Language);
+            // Language and theme must be known before building the (localized) controls.
+            WorkspaceState saved = RuleStore.LoadWorkspace(_workspacePath);
+            L.Set(saved.Language);
+            Theme.Set(saved.Theme);
 
             Text = "WPAD / PAC File Manager";
             Width = 1040; Height = 700;
@@ -49,8 +50,28 @@ namespace WpadManager.App
             catch { }
 
             BuildAllUi();
+            FitWidthToToolbar();
             LoadWorkspace();
             RefreshAll();
+
+            // "Match Windows" follows the system light/dark switch (and high contrast) live.
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged += SystemThemeChanged;
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            // SystemEvents is static: unsubscribe or it keeps this form alive.
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged -= SystemThemeChanged;
+            base.OnFormClosed(e);
+        }
+
+        private void SystemThemeChanged(object sender, Microsoft.Win32.UserPreferenceChangedEventArgs e)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            BeginInvoke((MethodInvoker)delegate
+            {
+                if (!IsDisposed && Theme.IsDark != _appliedDark) RebuildUi();
+            });
         }
 
         // ---- active document accessors ----
@@ -78,12 +99,34 @@ namespace WpadManager.App
             BuildGrid();
             BuildFindings();
             BuildStatusBar();
+            Theme.Apply(this);
+            _appliedDark = Theme.IsDark;
         }
 
-        // Rebuild the whole window after a language change (state lives in _docs).
+        // Open wide enough that no toolbar button starts out in the overflow menu (the Russian
+        // labels are long), but never wider than the screen's working area.
+        private void FitWidthToToolbar()
+        {
+            foreach (Control c in Controls)
+            {
+                ToolStrip ts = c as ToolStrip;
+                if (ts == null || ts is StatusStrip) continue;
+                // ToolStrip.GetPreferredSize under-reports once items overflow, so add them up.
+                int need = ts.Padding.Horizontal + (Width - ClientSize.Width) + 24;
+                foreach (ToolStripItem it in ts.Items)
+                    need += it.GetPreferredSize(Size.Empty).Width + it.Margin.Horizontal;
+                int max = Screen.FromControl(this).WorkingArea.Width;
+                Width = Math.Min(Math.Max(Width, need), max);
+            }
+        }
+
+        // Rebuild the whole window after a language or theme change (state lives in _docs).
         private void RebuildUi()
         {
+            Control[] old = new Control[Controls.Count];
+            Controls.CopyTo(old, 0);
             Controls.Clear();
+            for (int i = 0; i < old.Length; i++) old[i].Dispose();   // free their window handles
             BuildAllUi();
             RefreshAll();
         }
@@ -117,21 +160,39 @@ namespace WpadManager.App
             ts.Items.Add(new ToolStripSeparator());
             AddButton(ts, L.T("Сохранить в файл", "Save to file"), SaveToFile);
             AddButton(ts, L.T("История", "History"), OpenHistory);
-            ts.Items.Add(new ToolStripSeparator());
 
-            ts.Items.Add(new ToolStripLabel(L.T("Язык:", "Lang:")));
-            _lang = new ToolStripComboBox();
-            _lang.DropDownStyle = ComboBoxStyle.DropDownList;
-            _lang.Items.Add("Русский");
-            _lang.Items.Add("English");
-            _lang.Width = 92;
-            _suppressLang = true;
-            _lang.SelectedIndex = (L.Current == AppLang.En) ? 1 : 0;
-            _suppressLang = false;
-            _lang.SelectedIndexChanged += LangSelected;
-            ts.Items.Add(_lang);
+            // Language and theme share one drop-down so the busy toolbar keeps its room.
+            ToolStripDropDownButton settings = new ToolStripDropDownButton(L.T("Настройки", "Settings"));
+            settings.Alignment = ToolStripItemAlignment.Right;
+            settings.Overflow = ToolStripItemOverflow.Never;   // always reachable, even in a narrow window
+
+            ToolStripMenuItem lang = new ToolStripMenuItem(L.T("Язык", "Language"));
+            lang.DropDownItems.Add(Choice("Русский", L.Current == AppLang.Ru,
+                delegate { SetLanguage(AppLang.Ru); }));
+            lang.DropDownItems.Add(Choice("English", L.Current == AppLang.En,
+                delegate { SetLanguage(AppLang.En); }));
+
+            ToolStripMenuItem theme = new ToolStripMenuItem(L.T("Тема", "Theme"));
+            theme.DropDownItems.Add(Choice(L.T("Как в Windows", "Match Windows"), Theme.Mode == ThemeMode.System,
+                delegate { SetTheme(ThemeMode.System); }));
+            theme.DropDownItems.Add(Choice(L.T("Светлая", "Light"), Theme.Mode == ThemeMode.Light,
+                delegate { SetTheme(ThemeMode.Light); }));
+            theme.DropDownItems.Add(Choice(L.T("Тёмная", "Dark"), Theme.Mode == ThemeMode.Dark,
+                delegate { SetTheme(ThemeMode.Dark); }));
+
+            settings.DropDownItems.Add(lang);
+            settings.DropDownItems.Add(theme);
+            ts.Items.Add(settings);
 
             Controls.Add(ts);
+        }
+
+        private static ToolStripMenuItem Choice(string text, bool isChecked, EventHandler onClick)
+        {
+            ToolStripMenuItem mi = new ToolStripMenuItem(text);
+            mi.Checked = isChecked;
+            mi.Click += onClick;
+            return mi;
         }
 
         private void AddButton(ToolStrip ts, string text, EventHandler handler)
@@ -182,25 +243,56 @@ namespace WpadManager.App
             _findings.Height = 170;
             _findings.HorizontalScrollbar = true;
             _findings.Font = new Font(FontFamily.GenericMonospace, 8.5f);
+            // Owner-drawn so each line is colored by its severity (in both themes).
+            _findings.DrawMode = DrawMode.OwnerDrawFixed;
+            _findings.ItemHeight = TextRenderer.MeasureText("Ag", _findings.Font).Height + 2;
+            _findings.DrawItem += FindingsDrawItem;
             Controls.Add(_findings);
+        }
+
+        private void FindingsDrawItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0) return;
+            string line = _findings.Items[e.Index].ToString();
+            bool selected = (e.State & DrawItemState.Selected) != 0;
+            Palette p = Theme.P;
+            Color back = selected ? p.Selection : _findings.BackColor;
+            Color fore = selected ? p.SelectionText : Theme.SeverityColor(line, _findings.ForeColor);
+            using (SolidBrush b = new SolidBrush(back)) e.Graphics.FillRectangle(b, e.Bounds);
+            TextRenderer.DrawText(e.Graphics, line, e.Font, e.Bounds, fore,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix |
+                TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+            e.DrawFocusRectangle();
         }
 
         private void BuildStatusBar()
         {
             StatusStrip ss = new StatusStrip();
             _status = new ToolStripStatusLabel();
+            // Spring: take the free width and clip a long path, instead of the StatusStrip
+            // hiding the whole label once the text is wider than the window.
+            _status.Spring = true;
+            _status.TextAlign = ContentAlignment.MiddleLeft;
             ss.Items.Add(_status);
             Controls.Add(ss);
         }
 
-        // ---- language ----
+        // ---- language / theme ----
 
-        private void LangSelected(object sender, EventArgs e)
+        private void SetLanguage(AppLang lang)
         {
-            if (_suppressLang) return;
-            L.Current = (_lang.SelectedIndex == 1) ? AppLang.En : AppLang.Ru;
+            if (L.Current == lang) return;
+            L.Current = lang;
             SaveWorkspace();
-            // Defer the rebuild so we are not tearing down the combo inside its own event.
+            // Defer the rebuild so we are not tearing down the menu inside its own event.
+            this.BeginInvoke((MethodInvoker)delegate { RebuildUi(); });
+        }
+
+        private void SetTheme(ThemeMode mode)
+        {
+            if (Theme.Mode == mode) return;
+            Theme.Mode = mode;
+            SaveWorkspace();
             this.BeginInvoke((MethodInvoker)delegate { RebuildUi(); });
         }
 
@@ -287,6 +379,7 @@ namespace WpadManager.App
             for (int i = 0; i < _docs.Count; i++) ws.OpenFiles.Add(_docs[i].SourcePath);
             ws.ActiveFile = SourcePath;
             ws.Language = L.Code();
+            ws.Theme = Theme.Code();
             try { RuleStore.SaveWorkspace(_workspacePath, ws); } catch { }
         }
 
@@ -372,13 +465,13 @@ namespace WpadManager.App
                 string cond = r.Condition != null ? PacGenerator.GenCondition(r.Condition) : L.T("(пусто)", "(empty)");
                 string act = ActionText.Format(r.Action);
                 int idx = _grid.Rows.Add(r.Order, r.Enabled ? "✓" : "—", cond, act, r.Comment != null ? r.Comment : "");
-                if (!r.Enabled) _grid.Rows[idx].DefaultCellStyle.ForeColor = Color.Gray;
+                if (!r.Enabled) _grid.Rows[idx].DefaultCellStyle.ForeColor = Theme.P.TextMuted;
             }
             // The default action row — editable via double-click or the "По умолчанию…" button.
             string def = ActionText.Format(Current.DefaultAction);
             int di = _grid.Rows.Add("→", "", L.T("(по умолчанию)", "(default)"), def,
                 L.T("двойной клик — изменить", "double-click to edit"));
-            _grid.Rows[di].DefaultCellStyle.ForeColor = Color.DarkBlue;
+            _grid.Rows[di].DefaultCellStyle.ForeColor = Theme.P.Accent;
         }
 
         private bool IsDefaultRow(int rowIndex)
@@ -752,24 +845,37 @@ namespace WpadManager.App
 
         private void RunChecks(object sender, EventArgs e)
         {
-            _findings.Items.Clear();
             Report rep = BuildReport();
+            List<string> lines = new List<string>();
 
             if (rep.Findings.Count == 0)
             {
-                _findings.Items.Add(L.T("Проблем не найдено. OK.", "No problems found. OK."));
-                return;
+                lines.Add(L.T("Проблем не найдено. OK.", "No problems found. OK."));
             }
-            _findings.Items.Add(L.T("Найдено: ", "Found: ") + rep.Count(Severity.Critical) + " critical, " +
-                rep.Count(Severity.Error) + " error, " + rep.Count(Severity.Warning) +
-                " warning, " + rep.Count(Severity.Info) + " info");
-            for (int i = 0; i < rep.Findings.Count; i++)
+            else
             {
-                Finding f = rep.Findings[i];
-                string loc = Loc(f);
-                _findings.Items.Add("[" + f.Severity.ToString().ToUpperInvariant() + "] " +
-                    (loc.Length > 0 ? loc + " — " : "") + f.Message);
+                lines.Add(L.T("Найдено: ", "Found: ") + rep.Count(Severity.Critical) + " critical, " +
+                    rep.Count(Severity.Error) + " error, " + rep.Count(Severity.Warning) +
+                    " warning, " + rep.Count(Severity.Info) + " info");
+                for (int i = 0; i < rep.Findings.Count; i++)
+                {
+                    Finding f = rep.Findings[i];
+                    string loc = Loc(f);
+                    lines.Add("[" + f.Severity.ToString().ToUpperInvariant() + "] " +
+                        (loc.Length > 0 ? loc + " — " : "") + f.Message);
+                }
             }
+
+            // An owner-drawn list cannot measure its items, so size the horizontal scroll here.
+            int widest = 0;
+            for (int i = 0; i < lines.Count; i++)
+                widest = Math.Max(widest, TextRenderer.MeasureText(lines[i], _findings.Font).Width);
+
+            _findings.BeginUpdate();
+            _findings.Items.Clear();
+            _findings.Items.AddRange(lines.ToArray());
+            _findings.HorizontalExtent = widest + 8;
+            _findings.EndUpdate();
         }
 
         // ---- DNS resolve: is each rule's domain still live? ----
@@ -831,7 +937,9 @@ namespace WpadManager.App
             close.SetBounds(580, 7, 84, 28); bottom.Controls.Add(close);
             f.Controls.Add(bottom);
             f.AcceptButton = close;
+            Theme.Apply(f);
             f.ShowDialog(this);
+            f.Dispose();
         }
 
         // ---- simulator ----
@@ -939,8 +1047,10 @@ namespace WpadManager.App
 
             f.Controls.Add(l); f.Controls.Add(t); f.Controls.Add(ok); f.Controls.Add(cancel);
             f.AcceptButton = ok; f.CancelButton = cancel;
+            Theme.Apply(f);
 
-            return f.ShowDialog() == DialogResult.OK ? t.Text : null;
+            using (f)
+                return f.ShowDialog() == DialogResult.OK ? t.Text : null;
         }
     }
 }

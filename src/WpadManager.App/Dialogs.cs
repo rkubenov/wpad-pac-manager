@@ -146,6 +146,7 @@ namespace WpadManager.App
             cancel.SetBounds(492, 472, 84, 30);
             Controls.Add(ok); Controls.Add(cancel);
             AcceptButton = ok; CancelButton = cancel;
+            Theme.Apply(this);
         }
 
         private void Add(Label l, string text, int x, int y, int w, int h, FontStyle style)
@@ -305,6 +306,7 @@ namespace WpadManager.App
             close.SetBounds(528, 460, 84, 28);
             Controls.Add(close);
             CancelButton = close;
+            Theme.Apply(this);
         }
 
         private void Lbl(string text, int x, int y, int w)
@@ -395,6 +397,7 @@ namespace WpadManager.App
             close.SetBounds(576, 9, 84, 28);
             bottom.Controls.Add(rollback); bottom.Controls.Add(close);
             Controls.Add(bottom);
+            Theme.Apply(this);
         }
 
         private void DoRollback()
