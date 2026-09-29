@@ -107,10 +107,20 @@ namespace WpadManager.App
             string storePath = args[1], outPath = args[2];
             if (!File.Exists(storePath)) { Console.WriteLine("Store not found: " + storePath); return 1; }
 
+            // A JSON store is plain, editable text: the generated PAC passes the same write
+            // gate as the GUI before it is written.
             Store store = RuleStore.Load(storePath);
-            string pac = PacGenerator.Generate(store.Current);
+            string pac;
+            Report rep = Gate.Check(store.Current, out pac);
+            if (rep.HasErrors)
+            {
+                Console.WriteLine("Refusing to export " + storePath + ": the rule set has errors.");
+                PrintFindings(rep);
+                return 1;
+            }
             File.WriteAllText(outPath, pac);
             Console.WriteLine("Wrote " + outPath + " (" + store.Current.Rules.Count + " rules).");
+            if (rep.Findings.Count > 0) PrintFindings(rep);
             return 0;
         }
 

@@ -43,6 +43,10 @@ namespace WpadManager.Tests
             Validation();
             Console.WriteLine("== Safety ==");
             SafetyChecks();
+            Console.WriteLine("== Security hardening ==");
+            SecurityHardeningChecks();
+            Console.WriteLine("== Write gate ==");
+            GateChecks();
             Console.WriteLine("== Shadowing ==");
             ShadowingChecks();
             Console.WriteLine("== Simulator ==");
@@ -326,6 +330,151 @@ namespace WpadManager.Tests
                 "  return \"DIRECT\";\n" +
                 "}\n";
             Check(Has(Safety.Analyze(typo), "SEC_UNKNOWN_CALL"), "unknown helper call flagged");
+        }
+
+        // Regression tests for the 2026-09 security review: places where the parser saw a
+        // different program than a browser would run (so code slipped past the Safety pass),
+        // and stored text that could break out of a comment or string when regenerated.
+        static void SecurityHardeningChecks()
+        {
+            string head = "function FindProxyForURL(url, host) {\n";
+            string tail = "  return \"DIRECT\";\n}\n";
+
+            // Code inside a computed member index is part of the AST and gets vetted.
+            Report idx = Safety.Analyze("var x = host[eval(\"1\")];\n" + head + tail);
+            Check(Has(idx, "SEC_DANGEROUS_CALL") && idx.HasErrors, "eval inside [ ] is flagged");
+
+            // Overriding a PAC built-in, or aliasing a dangerous global, is flagged.
+            Report ovr = Safety.Analyze("dnsResolve = eval;\n" + head + "  dnsResolve(\"1\");\n" + tail);
+            Check(Has(ovr, "SEC_BUILTIN_OVERRIDE") && ovr.HasErrors, "assigning to a PAC built-in is flagged");
+            Check(Has(ovr, "SEC_DANGEROUS_REF"), "bare reference to eval is flagged");
+            Check(Has(Safety.Analyze("function dnsDomainIs(h, d) { return true; }\n" + head + tail),
+                "SEC_BUILTIN_OVERRIDE"), "redefining a PAC built-in function is flagged");
+            Check(Has(Safety.Analyze("var isInNet = 1;\n" + head + tail), "SEC_BUILTIN_OVERRIDE"),
+                "var shadowing a PAC built-in is flagged");
+
+            // Prototype-chain escapes and `this`.
+            Check(Has(Safety.Analyze(head + "  var f = host[\"constructor\"];\n" + tail), "SEC_PROTO_ACCESS"),
+                "['constructor'] access is flagged");
+            Check(Has(Safety.Analyze(head + "  var f = url.constructor;\n" + tail), "SEC_PROTO_ACCESS"),
+                ".constructor access is flagged");
+            Check(Safety.Analyze(head + "  this.x = 1;\n" + tail).HasErrors, "access through `this` is an error");
+
+            // JS keywords the subset parser does not model cannot be vetted.
+            Report kw = Safety.Analyze(head + "  while (true) { }\n" + tail);
+            Check(Has(kw, "SEC_UNSUPPORTED") && kw.HasErrors, "unsupported keyword (while) is an error");
+
+            // CR, U+2028 and U+2029 end a // comment in JavaScript, so what follows is code.
+            Check(Has(Safety.Analyze(head + "  // note\reval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after CR in a // comment is vetted");
+            Check(Has(Safety.Analyze(head + "  // note\u2028eval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after U+2028 in a // comment is vetted");
+            Check(Has(Safety.Analyze(head + "  // note\u2029eval(\"1\");\n" + tail), "SEC_DANGEROUS_CALL"),
+                "code after U+2029 in a // comment is vetted");
+            RuleSet crlf = Imported(head.Replace("\n", "\r\n") +
+                "  // note\r\n  if (isPlainHostName(host)) return \"DIRECT\";\r\n" + tail.Replace("\n", "\r\n"));
+            Check(crlf.Rules.Count == 1 && crlf.Rules[0].Comment == "note", "CRLF comment still attaches to its rule");
+
+            // A DNS lookup of a computed name can leak every visited host to an outside resolver.
+            Report exf = Safety.Analyze(head + "  if (isResolvable(host + \".x.example.net\")) return \"DIRECT\";\n" + tail);
+            Check(Has(exf, "SEC_DNS_COMPUTED") && exf.HasErrors, "DNS lookup of a computed name is an error");
+            Check(Has(exf, "SEC_NAME_BUILD"), "building a name from host is flagged");
+            Report okDns = Safety.Analyze(head +
+                "  if (isInNet(myIpAddress(), \"10.0.0.0\", \"255.0.0.0\")) return \"DIRECT\";\n" +
+                "  if (isInNet(dnsResolve(host), \"10.0.0.0\", \"255.0.0.0\")) return \"DIRECT\";\n" +
+                "  if (isResolvable(host)) return \"DIRECT\";\n" + tail);
+            Eq(0, okDns.Findings.Count, "ordinary DNS helpers produce no findings");
+
+            // String escapes decode like JavaScript; raw line breaks in strings are errors.
+            RuleSet hx = Imported(head + "  if (dnsDomainIs(host, \"\\x2eexample.com\")) return \"DIRECT\";\n" + tail);
+            Eq(".example.com", hx.Rules[0].Condition.Args[0], "\\x escape decoded");
+            RuleSet ux = Imported(head + "  if (dnsDomainIs(host, \"\\u002eexample.com\")) return \"DIRECT\";\n" + tail);
+            Eq(".example.com", ux.Rules[0].Condition.Args[0], "\\u escape decoded");
+            Check(!PacImporter.Import(head + "  if (dnsDomainIs(host, \"a\rb\")) return \"DIRECT\";\n" + tail).Ok,
+                "raw CR inside a string literal is a syntax error");
+
+            // Generator: stored text (e.g. from an edited .history.json) stays inert.
+            RuleSet rs = Imported(head + "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" + tail);
+            rs.Name = "n\nvar a = eval(\"1\");";
+            rs.Rules[0].Comment = "c\u2028var b = eval(\"2\");";
+            rs.Rules[0].Condition.Args[0] = ".example.com\u2028\r\n\"x";
+            UnparsedBlock top = new UnparsedBlock();
+            top.Reason = "Top-level x\rvar c = eval(\"3\");"; top.RawText = "";
+            rs.Unparsed.Add(top);
+            UnparsedBlock body = new UnparsedBlock();
+            body.Reason = "r */ var d = eval(\"4\"); /*"; body.RawText = "";
+            rs.Unparsed.Add(body);
+            string gen = PacGenerator.Generate(rs);
+            Eq(0, Safety.Analyze(gen).Findings.Count, "injected comment/string text stays inert in generated PAC");
+            PacImportResult back = PacImporter.Import(gen);
+            Check(back.Ok && back.RuleSet.Rules.Count == 1, "generated PAC re-imports with one rule");
+            Check(back.Ok && back.RuleSet.Rules[0].Condition.Args[0] == ".example.com\u2028\r\n\"x",
+                "string with line breaks and quotes round-trips exactly");
+
+            // A malformed subject / function name is an error and is never emitted as code.
+            RuleSet sub = Imported(head + "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" + tail);
+            sub.Rules[0].Condition.Subject = "host) || true || (host";
+            Check(Has(Validator.Validate(sub), "COND_BAD_SUBJECT"), "malformed subject is an error");
+            Check(!PacGenerator.Generate(sub).Contains("|| true ||"), "malformed subject is never emitted");
+            sub.Rules[0].Condition.Subject = "host";
+            sub.Rules[0].Condition.Fn = "x) || eval(\"1\") || (y";
+            Check(!PacGenerator.Generate(sub).Contains("eval"), "malformed function name is never emitted");
+        }
+
+        // Every path that writes a PAC (save, export, history restore, CLI export) goes
+        // through Gate.Check, which vets the exact text it returns for writing.
+        static void GateChecks()
+        {
+            string pac =
+                "function FindProxyForURL(url, host) {\n" +
+                "  if (isPlainHostName(host)) return \"DIRECT\";\n" +
+                "  if (dnsDomainIs(host, \".example.com\")) return \"DIRECT\";\n" +
+                "  if (isInNet(myIpAddress(), \"10.10.0.0\", \"255.255.255.0\")) return \"PROXY a.example.com:3128; DIRECT\";\n" +
+                "  return \"PROXY main.example.com:3128; DIRECT\";\n" +
+                "}\n";
+
+            string text;
+            Report ok = Gate.Check(Imported(pac), out text);
+            Check(!Gate.IsBlocking(ok), "gate: clean rule set passes");
+            Check(text.Contains("function FindProxyForURL") && text.Contains("main.example.com:3128"),
+                "gate: returns the generated PAC text");
+            Check(Safety.Analyze(text).Findings.Count == 0, "gate: returned text is itself clean");
+
+            // A tampered snapshot is blocked, with the finding attributed to its rule.
+            RuleSet bad = Imported(pac);
+            bad.Rules[1].Condition.Subject = "eval(\"1\")";
+            Report br = Gate.Check(bad, out text);
+            Check(Gate.IsBlocking(br) && br.HasErrors, "gate: injected call blocks the write");
+            Finding hit = First(br, "SEC_DANGEROUS_CALL");
+            Check(hit != null && hit.Order == 1, "gate: security finding attributed to rule 1");
+
+            // Same, end to end through a history sidecar on disk (the rollback source).
+            string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "wpad-gate-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".history.json");
+            try
+            {
+                Store st = new Store();
+                RuleStore.Commit(st, Imported(pac), "tester", "v1");
+                RuleStore.Save(tmp, st);
+                string json = System.IO.File.ReadAllText(tmp)
+                    .Replace("\"Subject\": \"host\"", "\"Subject\": \"host) || eval(\\\"1\\\") || (host\"");
+                System.IO.File.WriteAllText(tmp, json);
+
+                Store loaded = RuleStore.Load(tmp);
+                Check(RuleStore.Rollback(loaded, loaded.Versions[0].Id, "tester"), "gate: tampered version rolls back in memory");
+                Report rr = Gate.Check(loaded.Current, out text);
+                Check(Gate.IsBlocking(rr), "gate: tampered history version cannot be written");
+                Check(!text.Contains("eval"), "gate: tampered subject never reaches the PAC text");
+            }
+            finally
+            {
+                try { System.IO.File.Delete(tmp); } catch { }
+            }
+
+            // Info findings (valid narrow-before-broad exceptions) do not block.
+            Report info = new Report();
+            info.Add(Finding.Make(Severity.Info, "EXCEPTION", "x", null, 0));
+            Check(!Gate.IsBlocking(info), "gate: info-only report does not block");
         }
 
         static void ShadowingChecks()

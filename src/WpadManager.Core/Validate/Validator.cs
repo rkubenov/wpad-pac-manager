@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using WpadManager.Core.Model;
+using WpadManager.Core.Parser;
 
 namespace WpadManager.Core.Validate
 {
@@ -96,6 +97,16 @@ namespace WpadManager.Core.Validate
             }
 
             // Single
+            // The subject is written back out as code, so it must be exactly one operand
+            // (host, url, myIpAddress(), ...). Imports always satisfy this; a violation means
+            // the stored model was edited by hand.
+            if (c.Subject != null && !JsParser.IsSimpleOperand(c.Subject))
+            {
+                report.Add(Finding.Make(Severity.Error, "COND_BAD_SUBJECT",
+                    "Condition subject '" + c.Subject + "' is not a single operand (host, url, myIpAddress(), ...).",
+                    r.Id, r.Order));
+            }
+
             string fn = c.Fn;
             if (!PacFunctions.IsKnown(fn))
             {

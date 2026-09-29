@@ -487,8 +487,32 @@ namespace WpadManager.App
             SaveFileDialog d = new SaveFileDialog();
             d.Filter = "PAC file (*.pac)|*.pac|WPAD file (*.dat)|*.dat|All files (*.*)|*.*";
             d.FileName = !string.IsNullOrEmpty(SourcePath) ? Path.GetFileName(SourcePath) : "proxy.pac";
+
+            // An exported file is as deployable as a saved one, so it passes the same gate.
+            string pac;
+            Report rep = Gate.Check(Current, out pac);
+            if (HasBlockingIssues(rep))
+            {
+                MessageBox.Show(
+                    L.T("Экспорт отменён: в файле есть проблемы, которые нужно исправить.\n\n",
+                        "Export cancelled: the file has problems that must be fixed.\n\n") +
+                    BlockingSummary(rep),
+                    L.T("Экспорт заблокирован", "Export blocked"),
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
             if (d.ShowDialog() != DialogResult.OK) return;
-            File.WriteAllText(d.FileName, PacGenerator.Generate(Current));
+            try
+            {
+                File.WriteAllText(d.FileName, pac);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(L.T("Не удалось записать файл:\n", "Could not write file:\n") + ex.Message,
+                    L.T("Экспорт", "Export"), MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
             MessageBox.Show(L.T("Сохранено: ", "Saved: ") + d.FileName, L.T("Экспорт", "Export"),
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -499,8 +523,10 @@ namespace WpadManager.App
         {
             if (!RequireDoc()) return;
 
-            // Refuse to write a file that still has problems — fix them first.
-            Report rep = BuildReport();
+            // Refuse to write a file that still has problems — fix them first. The text that
+            // passed the gate is exactly what gets written below.
+            string pac;
+            Report rep = Gate.Check(Current, out pac);
             if (HasBlockingIssues(rep))
             {
                 MessageBox.Show(
@@ -522,7 +548,7 @@ namespace WpadManager.App
             {
                 // Snapshot into this file's history, write the .dat, update its sidecar.
                 RuleStore.Commit(Doc, Current, Environment.UserName, note);
-                File.WriteAllText(SourcePath, PacGenerator.Generate(Current));
+                File.WriteAllText(SourcePath, pac);
                 RuleStore.Save(RuleStore.SidecarPath(SourcePath), Doc);
                 SaveWorkspace();
                 SetStatus();
@@ -688,40 +714,19 @@ namespace WpadManager.App
 
         // ---- validation panel ----
 
-        // The combined diagnostics for the current rule set (safety + structure + shadowing).
+        // The combined diagnostics for the current rule set (safety + structure + shadowing),
+        // from the same write gate that save / export / restore go through.
         private Report BuildReport()
         {
-            Report rep = new Report();
-
-            // The safety pass works on generated source and reports by line; translate those
-            // line numbers back to the rule the operator sees, so findings read "rule N".
-            System.Collections.Generic.Dictionary<int, int> lineToOrder;
-            string src = PacGenerator.Generate(Current, out lineToOrder);
-            Report safety = Safety.Analyze(src);
-            for (int i = 0; i < safety.Findings.Count; i++)
-            {
-                Finding f = safety.Findings[i];
-                int order;
-                if (f.Order < 0 && f.Line > 0 && lineToOrder.TryGetValue(f.Line, out order))
-                {
-                    f.Order = order;
-                    f.Line = 0;
-                }
-            }
-            Append(rep, safety);
-
-            Append(rep, Validator.Validate(Current));
-            Append(rep, Shadowing.Analyze(Current));
-            return rep;
+            string pac;
+            return Gate.Check(Current, out pac);
         }
 
         // A file is "clean enough" to save / simulate only if it has no Warning, Error or
         // Critical findings. (Info — e.g. valid narrow-before-broad exceptions — is allowed.)
         private static bool HasBlockingIssues(Report rep)
         {
-            for (int i = 0; i < rep.Findings.Count; i++)
-                if (rep.Findings[i].Severity != Severity.Info) return true;
-            return false;
+            return Gate.IsBlocking(rep);
         }
 
         private static string Loc(Finding f)
@@ -765,11 +770,6 @@ namespace WpadManager.App
                 _findings.Items.Add("[" + f.Severity.ToString().ToUpperInvariant() + "] " +
                     (loc.Length > 0 ? loc + " — " : "") + f.Message);
             }
-        }
-
-        private void Append(Report into, Report from)
-        {
-            for (int i = 0; i < from.Findings.Count; i++) into.Add(from.Findings[i]);
         }
 
         // ---- DNS resolve: is each rule's domain still live? ----
@@ -878,12 +878,32 @@ namespace WpadManager.App
                 if (h.ShowDialog(this) == DialogResult.OK && h.SelectedVersionId != null)
                 {
                     RuleStore.Rollback(Doc, h.SelectedVersionId, Environment.UserName);
+                    RefreshGrid();
+                    SetStatus();
+                    RunChecks(null, null);
+
+                    // The history lives in an editable JSON sidecar, so a restored version gets
+                    // the same gate as a normal save before it may overwrite the live file.
+                    string pac;
+                    Report rep = Gate.Check(Current, out pac);
+                    if (HasBlockingIssues(rep))
+                    {
+                        MessageBox.Show(
+                            L.T("Вариант восстановлен в редакторе, но файл НЕ перезаписан: в нём есть проблемы.\n\n",
+                                "The version was restored in the editor, but the file was NOT rewritten: it has problems.\n\n") +
+                            BlockingSummary(rep) +
+                            L.T("\nИсправьте их (панель проверки внизу) и нажмите «Сохранить в файл».",
+                                "\nFix them (check panel below) and press “Save to file”."),
+                            L.T("Восстановление", "Restore"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+
                     // Reflect the restored variant in the actual source file + sidecar too.
                     if (!string.IsNullOrEmpty(SourcePath))
                     {
                         try
                         {
-                            File.WriteAllText(SourcePath, PacGenerator.Generate(Current));
+                            File.WriteAllText(SourcePath, pac);
                             RuleStore.Save(RuleStore.SidecarPath(SourcePath), Doc);
                         }
                         catch (Exception ex)
@@ -891,11 +911,9 @@ namespace WpadManager.App
                             MessageBox.Show(L.T("Восстановлено в приложении, но файл переписать не удалось:\n",
                                 "Restored in the app, but the file could not be rewritten:\n") + ex.Message,
                                 L.T("Восстановление", "Restore"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
                         }
                     }
-                    RefreshGrid();
-                    SetStatus();
-                    RunChecks(null, null);
                     MessageBox.Show(L.T("Вариант восстановлен.", "Version restored."),
                         L.T("История", "History"), MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }

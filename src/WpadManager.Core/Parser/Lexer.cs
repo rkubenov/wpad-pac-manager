@@ -82,13 +82,29 @@ namespace WpadManager.Core.Parser
             return toks;
         }
 
+        // JavaScript line terminators. A // comment ends at ANY of these, not only at '\n';
+        // treating e.g. a lone '\r' as comment text would hide the code after it from the
+        // Safety pass while a browser happily executes it.
+        public static bool IsLineTerminator(char c)
+        {
+            return c == '\n' || c == '\r' || c == '\u2028' || c == '\u2029';
+        }
+
+        // Advance past one line terminator at _i (CRLF counts as a single line break).
+        private void ConsumeLineTerminator()
+        {
+            if (_s[_i] == '\r' && _i + 1 < _s.Length && _s[_i + 1] == '\n') _i++;
+            _i++;
+            _line++;
+        }
+
         private void SkipTrivia()
         {
             while (_i < _s.Length)
             {
                 char c = _s[_i];
-                if (c == '\n') { _line++; _i++; continue; }
-                if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') { _i++; continue; }
+                if (IsLineTerminator(c)) { ConsumeLineTerminator(); continue; }
+                if (c == ' ' || c == '\t' || c == '\f' || c == '\v') { _i++; continue; }
                 if (c == '/' && _i + 1 < _s.Length && _s[_i + 1] == '/') { ReadLineComment(); continue; }
                 if (c == '/' && _i + 1 < _s.Length && _s[_i + 1] == '*') { ReadBlockComment(); continue; }
                 break;
@@ -101,7 +117,7 @@ namespace WpadManager.Core.Parser
             int line = _line;
             _i += 2;
             int textStart = _i;
-            while (_i < _s.Length && _s[_i] != '\n') _i++;
+            while (_i < _s.Length && !IsLineTerminator(_s[_i])) _i++;
             Comment cm = new Comment();
             cm.Block = false;
             cm.Text = _s.Substring(textStart, _i - textStart).Trim();
@@ -119,8 +135,8 @@ namespace WpadManager.Core.Parser
             int textStart = _i;
             while (_i + 1 < _s.Length && !(_s[_i] == '*' && _s[_i + 1] == '/'))
             {
-                if (_s[_i] == '\n') _line++;
-                _i++;
+                if (IsLineTerminator(_s[_i])) ConsumeLineTerminator();
+                else _i++;
             }
             int textEnd = _i;
             if (_i + 1 < _s.Length) _i += 2; else _i = _s.Length; // consume */
@@ -180,26 +196,87 @@ namespace WpadManager.Core.Parser
                     t.StringValue = sb.ToString();
                     return t;
                 }
-                if (c == '\n') throw new LexError("Unterminated string literal", start, line);
+                // A raw line break is a syntax error in a JS string; U+2028/U+2029 are only
+                // legal since ES2019, so older PAC engines would reject them too.
+                if (IsLineTerminator(c)) throw new LexError("Line break inside string literal", start, line);
                 if (c == '\\')
                 {
                     if (_i >= _s.Length) break;
-                    char e = _s[_i++];
-                    switch (e)
-                    {
-                        case 'n': sb.Append('\n'); break;
-                        case 't': sb.Append('\t'); break;
-                        case 'r': sb.Append('\r'); break;
-                        case '\\': sb.Append('\\'); break;
-                        case '\'': sb.Append('\''); break;
-                        case '"': sb.Append('"'); break;
-                        case '/': sb.Append('/'); break;
-                        default: sb.Append(e); break;
-                    }
+                    ReadEscape(sb, start, line);
                 }
                 else sb.Append(c);
             }
             throw new LexError("Unterminated string literal", start, line);
+        }
+
+        // Decode one escape (the backslash is already consumed) exactly as JavaScript does,
+        // so the value we analyze and re-emit is the value the browser sees.
+        private void ReadEscape(StringBuilder sb, int start, int line)
+        {
+            char e = _s[_i];
+            if (IsLineTerminator(e))
+            {
+                ConsumeLineTerminator();   // line continuation: contributes nothing
+                return;
+            }
+            _i++;
+            switch (e)
+            {
+                case 'n': sb.Append('\n'); return;
+                case 't': sb.Append('\t'); return;
+                case 'r': sb.Append('\r'); return;
+                case 'b': sb.Append('\b'); return;
+                case 'f': sb.Append('\f'); return;
+                case 'v': sb.Append('\v'); return;
+                case 'x': sb.Append((char)ReadHex(2, start, line)); return;
+                case 'u':
+                    if (_i < _s.Length && _s[_i] == '{')
+                    {
+                        _i++;
+                        int end = _s.IndexOf('}', _i);
+                        if (end < 0 || end == _i || end - _i > 6)
+                            throw new LexError("Invalid \\u{...} escape", start, line);
+                        int cp = ReadHex(end - _i, start, line);
+                        _i++; // }
+                        if (cp > 0x10FFFF) throw new LexError("Invalid \\u{...} escape", start, line);
+                        if (cp <= 0xFFFF) sb.Append((char)cp);   // incl. lone surrogates, as JS allows
+                        else sb.Append(char.ConvertFromUtf32(cp));
+                    }
+                    else sb.Append((char)ReadHex(4, start, line));
+                    return;
+                case '0':
+                    if (_i < _s.Length && _s[_i] >= '0' && _s[_i] <= '9')
+                        throw new LexError("Octal escapes are not supported", start, line);
+                    sb.Append('\0');
+                    return;
+                default:
+                    if (e >= '1' && e <= '7')
+                        throw new LexError("Octal escapes are not supported", start, line);
+                    sb.Append(e);   // \\ \" \' \/ and identity escapes
+                    return;
+            }
+        }
+
+        private int ReadHex(int digits, int start, int line)
+        {
+            if (_i + digits > _s.Length) throw new LexError("Invalid hex escape", start, line);
+            int v = 0;
+            for (int k = 0; k < digits; k++)
+            {
+                int d = HexValue(_s[_i + k]);
+                if (d < 0) throw new LexError("Invalid hex escape", start, line);
+                v = v * 16 + d;
+            }
+            _i += digits;
+            return v;
+        }
+
+        private static int HexValue(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
         }
 
         private Token ReadPunc()

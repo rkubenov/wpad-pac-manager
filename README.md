@@ -26,10 +26,13 @@ rules visible, checks them, and keeps a per-file history so changes are safe and
 - Editable **default action** (the final fall-through `return`).
 - Condition & action **builder** — type a domain, URL pattern, subnet or proxy; the
   PAC expression is generated for you (and stays hand-editable).
-- **Validation** in three passes: security (forbids `eval`, host-object access, unknown calls),
-  structure (unknown functions with suggestions, argument counts, IP/mask, port ranges,
-  unreachable code), and **shadowing** (unreachable / duplicate / conflicting rules).
-  A file with warnings or errors **cannot be saved or simulated**.
+- **Validation** in three passes: security (forbids `eval`/`Function`/host objects,
+  prototype-chain escapes, redefinition of PAC built-ins, DNS lookups of computed names,
+  unknown calls and JS constructs the parser cannot vet), structure (unknown functions with
+  suggestions, argument counts, IP/mask, port ranges, unreachable code), and **shadowing**
+  (unreachable / duplicate / conflicting rules). Every write — save, export, restore from
+  history, CLI export — goes through one gate that vets the exact text being written; a file
+  with warnings or errors **cannot be saved, exported, written back by a history restore, or simulated**.
 - **Duplicate / overlap warning** when adding a rule already covered by an existing one.
 - **Simulator** — three-valued (true / false / unknown) evaluation of a URL against the
   rules, with a per-rule trace. No JavaScript executed, no network needed.
@@ -59,7 +62,7 @@ press **Check**, and **Save to file**.
 ```
 WpadManager.exe --validate <file.pac>             # safety + structure + shadowing; exit 1 on errors
 WpadManager.exe --simulate <file> <url> <host>    # route trace and result
-WpadManager.exe --export <store.json> <out.pac>   # export rules from a JSON store
+WpadManager.exe --export <store.json> <out.pac>   # export rules from a JSON store; exit 1 (nothing written) on errors
 WpadManager.exe --help
 ```
 
