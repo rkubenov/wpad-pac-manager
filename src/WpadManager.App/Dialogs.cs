@@ -111,18 +111,18 @@ namespace WpadManager.App
 
             Add(new Label(), "host:port:", 166, 270, 60, 20, FontStyle.Regular);
             _actHostPort = new TextBox();
-            _actHostPort.SetBounds(230, 268, 160, 24);
+            _actHostPort.SetBounds(230, 268, 154, 24);
             _actHostPort.Enabled = false;
             Controls.Add(_actHostPort);
 
             _actFallback = new CheckBox();
             _actFallback.Text = "+ DIRECT";
-            _actFallback.SetBounds(396, 269, 90, 22);
+            _actFallback.SetBounds(390, 269, 80, 22);
             Controls.Add(_actFallback);
 
             Button actInsert = new Button();
             actInsert.Text = L.T("→ в действие", "→ insert");
-            actInsert.SetBounds(496, 267, 80, 26);
+            actInsert.SetBounds(476, 267, 100, 26);   // wide enough for "→ в действие" on one line
             actInsert.Click += delegate { _actText.Text = ComposeAction(); };
             Controls.Add(actInsert);
 
@@ -282,13 +282,19 @@ namespace WpadManager.App
         {
             _rs = rs;
             Text = L.T("Симулятор", "Simulator");
-            Width = 640; Height = 520;
+            // Size the client area, not the outer window: the title bar's height differs
+            // between Windows versions, and an outer Height left the Close button clipped.
+            ClientSize = new Size(624, 500);
+            MinimumSize = Size;
             StartPosition = FormStartPosition.CenterParent;
 
-            _url = new TextBox(); _url.SetBounds(120, 12, 490, 24); _url.Text = "http://"; Controls.Add(_url);
+            _url = new TextBox(); _url.SetBounds(120, 12, 490, 24); _url.Text = "http://";
+            _url.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            Controls.Add(_url);
             // Host is the domain part of the URL; the browser derives it the same way,
             // so we auto-extract it and show it read-only rather than asking for it.
             _host = new TextBox(); _host.SetBounds(120, 42, 490, 24);
+            _host.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             _host.ReadOnly = true; _host.BackColor = SystemColors.Control; Controls.Add(_host);
             _myip = new TextBox(); _myip.SetBounds(120, 72, 200, 24); Controls.Add(_myip);
             _url.TextChanged += delegate { _host.Text = ExtractHost(_url.Text); };
@@ -312,11 +318,13 @@ namespace WpadManager.App
             _result.ScrollBars = ScrollBars.Vertical;
             _result.Font = new Font(FontFamily.GenericMonospace, 9f);
             _result.SetBounds(12, 164, 600, 290);
+            _result.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             Controls.Add(_result);
 
             Button close = new Button();
             close.Text = L.T("Закрыть", "Close"); close.DialogResult = DialogResult.Cancel;
-            close.SetBounds(528, 460, 84, 28);
+            close.SetBounds(528, 462, 84, 28);
+            close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             Controls.Add(close);
             CancelButton = close;
             Theme.Apply(this);
