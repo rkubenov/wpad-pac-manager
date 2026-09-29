@@ -17,7 +17,14 @@ namespace WpadManager.App
         [STAThread]
         private static int Main(string[] args)
         {
-            if (args != null && args.Length > 0)
+            // A single existing file (Explorer "Open with…", drag onto the .exe) opens the GUI
+            // with that file; anything else with arguments is the command line.
+            string openFile = null;
+            if (args != null && args.Length == 1 && !args[0].StartsWith("-") && !args[0].StartsWith("/") &&
+                System.IO.File.Exists(args[0]))
+                openFile = args[0];
+
+            if (args != null && args.Length > 0 && openFile == null)
             {
                 AttachConsole(ATTACH_PARENT_PROCESS);
                 return Cli.Run(args);
@@ -25,7 +32,7 @@ namespace WpadManager.App
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            Application.Run(new MainForm(openFile));
             return 0;
         }
     }

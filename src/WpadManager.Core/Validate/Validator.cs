@@ -138,6 +138,35 @@ namespace WpadManager.Core.Validate
 
             if (fn == "isInNet") ValidateIsInNet(c, r, report);
             else if (fn == "isInNetEx") ValidateIsInNetEx(c, r, report);
+            else ValidateHostPattern(c, r, report);
+        }
+
+        // Host-name arguments. Browsers pass the host in lower case and the PAC helpers
+        // compare exactly, so upper case may never match. A suffix without a leading dot also
+        // matches unrelated names ("example.com" matches "notexample.com") — often intended
+        // (to include the bare domain), so that one is only a note.
+        private static void ValidateHostPattern(Condition c, Rule r, Report report)
+        {
+            if (c.Fn != "dnsDomainIs" && c.Fn != "localHostOrDomainIs" && c.Fn != "shExpMatch") return;
+            if (c.Subject != null && c.Subject != "host") return;
+            if (c.Args == null || c.Args.Count == 0 || string.IsNullOrEmpty(c.Args[0])) return;
+            string v = c.Args[0];
+
+            if (v != v.ToLowerInvariant())
+                report.Add(Finding.Make(Severity.Warning, "DOMAIN_CASE",
+                    "'" + v + "' has upper-case letters; browsers pass the host in lower case and compare " +
+                    "exactly, so this may never match. Write it in lower case.", r.Id, r.Order));
+
+            bool looseSuffix =
+                (c.Fn == "dnsDomainIs" && v[0] != '.' && v.IndexOf('.') > 0) ||
+                (c.Fn == "shExpMatch" && v.Length > 1 && v[0] == '*' && v[1] != '.' && v[1] != '*');
+            if (looseSuffix)
+            {
+                string bare = v.TrimStart('*');
+                report.Add(Finding.Make(Severity.Info, "DOMAIN_SUFFIX",
+                    "'" + v + "' also matches unrelated names that end the same way (e.g. 'not" + bare +
+                    "'); '." + bare + "' matches only subdomains.", r.Id, r.Order));
+            }
         }
 
         private static void ValidateIsInNet(Condition c, Rule r, Report report)

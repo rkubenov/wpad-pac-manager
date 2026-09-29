@@ -87,22 +87,41 @@ namespace WpadManager.Core.Validate
 
             HashSet<string> declared = new HashSet<string>(StringComparer.Ordinal);
             CollectDeclaredFns(prog, declared);
-            Walk(prog, null, declared, report);
+            Walk(prog, declared, report);
             return report;
         }
 
-        private static void CollectDeclaredFns(Node n, HashSet<string> declared)
+        private static void CollectDeclaredFns(Node root, HashSet<string> declared)
         {
-            if (n == null) return;
-            FunctionDecl fd = n as FunctionDecl;
-            if (fd != null && fd.Name != null) declared.Add(fd.Name);
-            foreach (Node c in Children(n)) CollectDeclaredFns(c, declared);
+            Stack<Node> pending = new Stack<Node>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                Node n = pending.Pop();
+                FunctionDecl fd = n as FunctionDecl;
+                if (fd != null && fd.Name != null) declared.Add(fd.Name);
+                foreach (Node c in Children(n)) pending.Push(c);
+            }
         }
 
-        private static void Walk(Node n, Node parent, HashSet<string> declared, Report report)
+        // Pre-order walk with an explicit stack: a long "a || b || ..." domain list is a
+        // left-deep tree thousands of levels deep, too deep for recursion.
+        private static void Walk(Node root, HashSet<string> declared, Report report)
         {
-            if (n == null) return;
+            Stack<KeyValuePair<Node, Node>> pending = new Stack<KeyValuePair<Node, Node>>();
+            pending.Push(new KeyValuePair<Node, Node>(root, null));
+            while (pending.Count > 0)
+            {
+                KeyValuePair<Node, Node> item = pending.Pop();
+                Inspect(item.Key, item.Value, declared, report);
+                List<Node> kids = Children(item.Key);
+                for (int i = kids.Count - 1; i >= 0; i--)   // reversed: children come off in order
+                    pending.Push(new KeyValuePair<Node, Node>(kids[i], item.Key));
+            }
+        }
 
+        private static void Inspect(Node n, Node parent, HashSet<string> declared, Report report)
+        {
             FunctionDecl fd = n as FunctionDecl;
             if (fd != null && fd.Name != null && fd.Name != "FindProxyForURL" && fd.Name != "FindProxyForURLEx" &&
                 IsBuiltin(fd.Name))
@@ -127,8 +146,6 @@ namespace WpadManager.Core.Validate
 
             BinaryExpr bin = n as BinaryExpr;
             if (bin != null) InspectBinary(bin, parent, report);
-
-            foreach (Node c in Children(n)) Walk(c, n, declared, report);
         }
 
         private static void InspectIdentifier(Identifier id, Node parent, Report report)
@@ -252,13 +269,18 @@ namespace WpadManager.Core.Validate
             }
         }
 
-        private static bool ConcatUsesHostOrUrl(Node n)
+        private static bool ConcatUsesHostOrUrl(Node root)
         {
-            Identifier id = n as Identifier;
-            if (id != null) return id.Name == "host" || id.Name == "url";
-            BinaryExpr b = n as BinaryExpr;
-            if (b != null && (b.Op == "+" || b.Op == "+="))
-                return ConcatUsesHostOrUrl(b.Left) || ConcatUsesHostOrUrl(b.Right);
+            Stack<Node> pending = new Stack<Node>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                Node n = pending.Pop();
+                Identifier id = n as Identifier;
+                if (id != null && (id.Name == "host" || id.Name == "url")) return true;
+                BinaryExpr b = n as BinaryExpr;
+                if (b != null && (b.Op == "+" || b.Op == "+=")) { pending.Push(b.Left); pending.Push(b.Right); }
+            }
             return false;
         }
 
@@ -278,7 +300,7 @@ namespace WpadManager.Core.Validate
         }
 
         // Enumerate the direct child nodes of any AST node (structural, type-driven).
-        private static IEnumerable<Node> Children(Node n)
+        private static List<Node> Children(Node n)
         {
             List<Node> list = new List<Node>();
 

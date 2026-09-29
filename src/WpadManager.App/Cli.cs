@@ -45,7 +45,7 @@ namespace WpadManager.App
             string path = args[1];
             if (!File.Exists(path)) { Console.WriteLine("File not found: " + path); return 1; }
 
-            string src = File.ReadAllText(path);
+            string src = TextFile.Read(path);   // detects UTF-8 / BOM / legacy ANSI (e.g. 1251)
             PacImportResult res = PacImporter.Import(src);
             if (!res.Ok)
             {
@@ -73,7 +73,7 @@ namespace WpadManager.App
             string path = args[1], url = args[2], host = args[3];
             if (!File.Exists(path)) { Console.WriteLine("File not found: " + path); return 1; }
 
-            PacImportResult res = PacImporter.Import(File.ReadAllText(path));
+            PacImportResult res = PacImporter.Import(TextFile.Read(path));
             if (!res.Ok) { Console.WriteLine("SYNTAX ERROR: " + res.SyntaxError); return 1; }
 
             SimInput input = new SimInput(url, host);
@@ -86,7 +86,7 @@ namespace WpadManager.App
             for (int i = 0; i < r.Trace.Count; i++)
             {
                 SimStep s = r.Trace[i];
-                Console.WriteLine("  rule " + s.Order + " [" + s.Result + "] " + s.Reason);
+                Console.WriteLine("  " + (s.Order >= 0 ? "rule " + s.Order : "code  ") + " [" + s.Result + "] " + s.Reason);
             }
             Console.WriteLine("---- result ----");
             if (r.Matched != null) Console.WriteLine("MATCHED rule " + r.Matched.Order);
@@ -118,7 +118,7 @@ namespace WpadManager.App
                 PrintFindings(rep);
                 return 1;
             }
-            File.WriteAllText(outPath, pac);
+            TextFile.Write(outPath, pac);   // atomic: a failed write leaves the old file intact
             Console.WriteLine("Wrote " + outPath + " (" + store.Current.Rules.Count + " rules).");
             if (rep.Findings.Count > 0) PrintFindings(rep);
             return 0;

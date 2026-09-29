@@ -17,7 +17,22 @@ namespace WpadManager.Core.Parser
         private readonly List<Token> _t;
         private int _p;
 
+        // Syntactic nesting (blocks, parentheses, unary operators, call arguments) deeper
+        // than this is a parse error. Real PAC files nest a handful of levels; without a cap
+        // a crafted file would overflow the stack, which .NET cannot catch. Long flat lists
+        // such as "a || b || c ..." are parsed iteratively and do not count.
+        private const int MaxDepth = 200;
+        private int _depth;
+
         public JsParser(List<Token> tokens) { _t = tokens; _p = 0; }
+
+        private void Enter()
+        {
+            if (++_depth > MaxDepth)
+                throw new ParseError("Nesting is too deep (more than " + MaxDepth + " levels)", Cur.Start, Cur.Line);
+        }
+
+        private void Leave() { _depth--; }
 
         public static Program ParseSource(string source)
         {
@@ -81,6 +96,14 @@ namespace WpadManager.Core.Parser
         }
 
         private Node ParseStatement()
+        {
+            Enter();
+            Node n = ParseStatementInner();
+            Leave();
+            return n;
+        }
+
+        private Node ParseStatementInner()
         {
             if (IsPunc(";")) { Next(); return null; }
             if (IsPunc("{")) return ParseBlock();
@@ -197,13 +220,15 @@ namespace WpadManager.Core.Parser
 
         private Node ParseAssignment()
         {
+            Enter();
             Node left = ParseConditional();
             if (IsPunc("=") || IsPunc("+=") || IsPunc("-=") || IsPunc("*=") || IsPunc("/="))
             {
                 string op = Next().Text;
                 Node right = ParseAssignment();
-                return MakeBinary(op, left, right);
+                left = MakeBinary(op, left, right);
             }
+            Leave();
             return left;
         }
 
@@ -301,7 +326,9 @@ namespace WpadManager.Core.Parser
             if (IsPunc("!") || IsPunc("-") || IsPunc("+"))
             {
                 Token op = Next();
+                Enter();
                 Node arg = ParseUnary();
+                Leave();
                 UnaryExpr u = new UnaryExpr();
                 u.Op = op.Text; u.Arg = arg;
                 u.Start = op.Start; u.Line = op.Line; u.End = arg.End; u.EndLine = arg.EndLine;

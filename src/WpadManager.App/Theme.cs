@@ -190,6 +190,14 @@ namespace WpadManager.App
                 if (sb is ScrollBar) SetExplorerTheme(sb, "DarkMode_Explorer");
         }
 
+        // A context menu is not among a form's controls, so it is styled on its own.
+        public static void StyleMenu(ToolStripDropDown menu)
+        {
+            Palette p = P;
+            if (!p.Dark) return;
+            StyleToolStrip(menu, p);
+        }
+
         private static void StyleToolStrip(ToolStrip ts, Palette p)
         {
             ts.Renderer = new DarkToolStripRenderer(p);

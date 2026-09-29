@@ -19,7 +19,7 @@ namespace WpadManager.Core.Simulate
         public string HostIp;     // optional pre-resolved IPv4 for isInNet; null = derive/unknown
         public string MyIp;       // optional client IP for isInNet(myIpAddress(), ...); null = unknown
         public DateTime? Now;      // optional clock for weekdayRange; null = time predicates Unknown
-        public bool AssumeResolvable = true; // isResolvable() default when no live DNS
+        public bool AssumeResolvable;  // treat isResolvable(name) as true; default: needs live DNS => Unknown
 
         public SimInput() { }
         public SimInput(string url, string host) { Url = url; Host = host; }
@@ -58,9 +58,16 @@ namespace WpadManager.Core.Simulate
             SimResult res = new SimResult();
             if (rs == null) { res.Action = new List<ProxyEntry>(); res.UsedDefault = true; return res; }
 
+            HashSet<string> ruleIds = new HashSet<string>();
+            for (int i = 0; i < rs.Rules.Count; i++) if (rs.Rules[i].Id != null) ruleIds.Add(rs.Rules[i].Id);
+
             for (int i = 0; i < rs.Rules.Count; i++)
             {
                 Rule r = rs.Rules[i];
+                // Preserved code that sits in front of this rule runs first; we cannot evaluate it.
+                for (int u = 0; u < rs.Unparsed.Count; u++)
+                    if (r.Id != null && rs.Unparsed[u].BeforeRuleId == r.Id) TraceUnparsed(rs.Unparsed[u], res);
+
                 SimStep step = new SimStep();
                 step.Order = r.Order;
                 step.RuleId = r.Id;
@@ -96,9 +103,31 @@ namespace WpadManager.Core.Simulate
                 res.Trace.Add(step);
             }
 
+            for (int u = 0; u < rs.Unparsed.Count; u++)
+            {
+                UnparsedBlock ub = rs.Unparsed[u];
+                if (ub.BeforeRuleId == null || !ruleIds.Contains(ub.BeforeRuleId)) TraceUnparsed(ub, res);
+            }
+
             res.UsedDefault = true;
             res.Action = rs.DefaultAction;
             return res;
+        }
+
+        // An in-body statement the recognizer could not model: if it can return, the real
+        // result may come from it, so everything after it is only a best guess.
+        private static void TraceUnparsed(UnparsedBlock ub, SimResult res)
+        {
+            if (ub.AfterDefault || ub.RawText == null) return;
+            if (ub.Reason != null && (ub.Reason.StartsWith("Top-level", StringComparison.Ordinal) ||
+                                      ub.Reason.StartsWith("Unreachable", StringComparison.Ordinal))) return;
+            if (ub.RawText.IndexOf("return", StringComparison.Ordinal) < 0) return;
+            SimStep step = new SimStep();
+            step.Order = -1;
+            step.Result = Tri.Unknown;
+            step.Reason = "preserved code (line " + ub.SourceLineStart + ") may return first; not evaluated";
+            res.Trace.Add(step);
+            res.HasIndeterminateBeforeMatch = true;
         }
 
         // ---- tri-state condition evaluation ----
@@ -155,40 +184,41 @@ namespace WpadManager.Core.Simulate
             return Tri.Unknown;
         }
 
+        // Semantics follow the reference PAC helpers (Chrome / Firefox): the browser passes
+        // the host in lower case and the URL with scheme and host lower-cased (path as is);
+        // dnsDomainIs, localHostOrDomainIs and shExpMatch compare case-sensitively.
         private static Tri EvalLeaf(Condition c, SimInput input)
         {
             string host = input.Host != null ? input.Host.ToLowerInvariant() : "";
-            string url = input.Url != null ? input.Url : "";
+            string url = CanonicalUrl(input.Url);
+            string s;   // the value the predicate looks at (host, url, client IP, resolved IP)
 
             switch (c.Fn)
             {
                 case "isPlainHostName":
-                    return B(host.IndexOf('.') < 0);
+                    if (!SubjectValue(c, input, host, url, out s)) return Tri.Unknown;
+                    return B(s.IndexOf('.') < 0);
 
                 case "dnsDomainIs":
                 {
                     string d = Arg(c, 0);
-                    if (d == null) return Tri.Unknown;
-                    return B(host.EndsWith(d.ToLowerInvariant(), StringComparison.Ordinal));
+                    if (d == null || !SubjectValue(c, input, host, url, out s)) return Tri.Unknown;
+                    return B(s.EndsWith(d, StringComparison.Ordinal));
                 }
 
                 case "localHostOrDomainIs":
                 {
+                    // host == hostdom, or host is the leading part of hostdom up to a dot
                     string hd = Arg(c, 0);
-                    if (hd == null) return Tri.Unknown;
-                    hd = hd.ToLowerInvariant();
-                    if (host == hd) return Tri.True;
-                    if (host.IndexOf('.') < 0 && hd.StartsWith(host + ".", StringComparison.Ordinal))
-                        return Tri.True;
-                    return Tri.False;
+                    if (hd == null || !SubjectValue(c, input, host, url, out s)) return Tri.Unknown;
+                    return B(s == hd || hd.StartsWith(s + ".", StringComparison.Ordinal));
                 }
 
                 case "shExpMatch":
                 {
                     string pat = Arg(c, 0);
-                    if (pat == null) return Tri.Unknown;
-                    string text = (c.Subject == "url") ? url : host;
-                    return B(Wildcard(text, pat));
+                    if (pat == null || !SubjectValue(c, input, host, url, out s)) return Tri.Unknown;
+                    return B(Wildcard(s, pat));
                 }
 
                 case "isInNet":
@@ -199,7 +229,12 @@ namespace WpadManager.Core.Simulate
 
                 case "isResolvable":
                 case "isResolvableEx":
+                {
+                    // An IP literal (or a supplied host IP) resolves; a name needs live DNS.
+                    byte[] ip;
+                    if (TryIp(host, out ip) || input.HostIp != null) return Tri.True;
                     return input.AssumeResolvable ? Tri.True : Tri.Unknown;
+                }
 
                 case "weekdayRange":
                     return EvalWeekday(c, input);
@@ -337,13 +372,52 @@ namespace WpadManager.Core.Simulate
 
         private static Tri B(bool b) { return b ? Tri.True : Tri.False; }
 
-        // shExpMatch-style glob: '*' = any run, '?' = any single char. Case-insensitive.
+        // What a predicate is applied to: host (or no subject), url, the client IP for
+        // myIpAddress(), the resolved IP for dnsResolve(host). False = unknown here (client IP
+        // not given, or a DNS lookup would be needed) — never guessed.
+        private static bool SubjectValue(Condition c, SimInput input, string host, string url, out string value)
+        {
+            value = null;
+            string subj = c.Subject != null ? c.Subject.Replace(" ", "") : null;
+            if (subj == null || subj == "host") { value = host; return true; }
+            if (subj == "url") { value = url; return true; }
+            if (subj == "myIpAddress()" || subj == "myIpAddressEx()")
+            {
+                if (input.MyIp == null) return false;
+                value = input.MyIp.Trim();
+                return true;
+            }
+            if (subj == "dnsResolve(host)" || subj == "dnsResolveEx(host)")
+            {
+                byte[] ip;
+                if (TryIp(host, out ip)) { value = host; return true; }
+                if (input.HostIp != null) { value = input.HostIp.Trim(); return true; }
+                return false;
+            }
+            return false;
+        }
+
+        // The URL as a browser hands it to FindProxyForURL: scheme and host lower-cased,
+        // the rest untouched.
+        internal static string CanonicalUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return "";
+            string u = url.Trim();
+            int scheme = u.IndexOf("://", StringComparison.Ordinal);
+            if (scheme < 0) return u;
+            int authEnd = u.IndexOfAny(new char[] { '/', '?', '#' }, scheme + 3);
+            if (authEnd < 0) authEnd = u.Length;
+            return u.Substring(0, authEnd).ToLowerInvariant() + u.Substring(authEnd);
+        }
+
+        // shExpMatch-style glob: '*' = any run, '?' = any single char. Case-sensitive, like
+        // the browsers' implementation (a RegExp without the i flag).
         internal static bool Wildcard(string text, string pattern)
         {
             if (text == null) text = "";
             if (pattern == null) return false;
-            string s = text.ToLowerInvariant();
-            string p = pattern.ToLowerInvariant();
+            string s = text;
+            string p = pattern;
             int si = 0, pi = 0, star = -1, ss = 0;
             while (si < s.Length)
             {
